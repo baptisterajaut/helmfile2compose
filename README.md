@@ -18,7 +18,7 @@ There are dozens of tools that go from Compose to Kubernetes ([Kompose](https://
 
 Well, me. My source of truth is the helmfile. The compose is a build artifact. And yes, using Kubernetes manifests as an intermediate representation to generate a docker-compose is absolutely using an ICBM to kill flies — which is exactly why I find it satisfying.
 
-I vibe-coded this glorious abomination with Claude rather than MAINTAIN A SEPARATE DOCKER-COMPOSE BY HAND. That's how much I refuse to maintain a docker-compose. This tool should not need to exist. Nobody should have asked me for this. And yet it works, it helps people, it fits in ~1000 lines of pure framework-less Python, and I'm unreasonably proud of it.
+I vibe-coded this glorious abomination with Claude rather than MAINTAIN A SEPARATE DOCKER-COMPOSE BY HAND. That's how much I refuse to maintain a docker-compose. This script should not need to exist. Nobody should have asked me for this. And yet it works. It fits in ~1000 lines of pure framework-less Python. As far as I know, nobody has ever made a K8s-to-compose converter powerful enough to be useful to anyone other than an insane cultist — and I'm unreasonably proud of that.
 
 > *The disciples beseeched the architect: render thy celestial works in common clay, that we may raise them without knowledge of the heavens. It was heresy. The architect obliged. The temples stood.*
 >
