@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import fnmatch
 import os
 import re
 import subprocess
@@ -54,6 +55,11 @@ _K8S_VAR_REF_RE = re.compile(r'\$\(([A-Za-z_][A-Za-z0-9_]*)\)')
 
 # Regex boundary for URL port rewriting (matches end-of-string or path/whitespace/quote)
 _URL_BOUNDARY = r'''(?=[/\s"']|$)'''
+
+
+def _is_excluded(name: str, exclude_list: list[str]) -> bool:
+    """Check if a workload name matches any exclude pattern (supports wildcards)."""
+    return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_list)
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +398,13 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
     name = meta.get("name", "unknown")
     full = f"{manifest.get('kind', '?')}/{name}"
 
-    if name in config.get("exclude", []):
+    if _is_excluded(name, config.get("exclude", [])):
+        return None
+
+    # Skip workloads scaled to zero (e.g. disabled AI services)
+    replicas = manifest.get("spec", {}).get("replicas")
+    if replicas is not None and replicas == 0:
+        warnings.append(f"{full} has replicas: 0 — skipped")
         return None
 
     pod_spec = manifest.get("spec", {}).get("template", {}).get("spec", {})

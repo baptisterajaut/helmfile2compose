@@ -110,7 +110,8 @@ volumes:
     host_path: ./custom    # explicit path (starts with ./ or /), used as-is
 
 exclude:
-  - prometheus-operator    # skip this workload
+  - prometheus-operator    # exact name
+  - meet-celery-*          # wildcard (fnmatch syntax)
 
 replacements:               # string replacements in generated files and env vars (port remaps are automatic)
   - old: 'path_style_buckets = false'
@@ -138,7 +139,7 @@ services:                   # custom services (not from K8s manifests)
 - **`name`** — compose project name. Auto-set to the source directory basename on first run.
 - **`volume_root`** — base path for volume host mounts (default: `./data`). Bare names in `host_path` are prefixed with this. Paths starting with `./` or `/` are used as-is. Auto-discovered PVCs default to `host_path: <pvc_name>` (resolved via `volume_root`).
 - **`volumes`** — map PVCs to named volumes or host paths.
-- **`exclude`** — skip workloads by name.
+- **`exclude`** — skip workloads by name or wildcard pattern (`fnmatch` syntax: `*`, `?`, `[seq]`). Workloads with `replicas: 0` are also auto-skipped.
 - **`replacements`** — global find/replace in generated ConfigMap/Secret files and env vars. Port remapping is now automatic; still useful for non-port rewrites (e.g. `path_style_buckets`).
 - **`overrides`** — shallow merge into generated services. Set a key to `null` to delete it. Useful for replacing bitnami images with vanilla ones, or injecting env vars.
 - **`services`** — add custom services not derived from K8s manifests. Combined with `restart: on-failure`, useful for one-shot init tasks (e.g. creating S3 buckets) that complement converted K8s Jobs.
@@ -164,12 +165,12 @@ Stoatchat-specific quirks handled via config:
 
 ### [suite-helmfile](https://github.com/suitenumerique) (La Suite)
 
-A larger helmfile (~16 charts) for a collaborative suite (docs, drive, people, keycloak, minio, postgresql, redis). **13 services + 5 init jobs running** via helmfile2compose. Validated automatic alias resolution, port remapping, Job conversion, and K8s variable escaping.
+A larger helmfile (~16 charts) for a collaborative suite (docs, drive, meet, people, conversations, keycloak, minio, postgresql, redis, livekit). **22 services + 11 init jobs running** via helmfile2compose. Validated automatic alias resolution, port remapping, Job conversion, K8s variable escaping, wildcard excludes, and replicas:0 auto-skip.
 
 ## Code quality
 
 ```bash
-pylint helmfile2compose.py          # 9.56/10
+pylint helmfile2compose.py          # 9.57/10
 pyflakes helmfile2compose.py        # clean
 radon cc helmfile2compose.py -a -s  # average B (~6), no D/E/F
 ```

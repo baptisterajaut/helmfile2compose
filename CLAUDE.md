@@ -10,7 +10,7 @@ Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic co
 
 ## What exists
 
-Single script `helmfile2compose.py` (~1095 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~1109 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -59,6 +59,7 @@ volumes:
     host_path: ./custom    # explicit path, used as-is
 exclude:
   - prometheus-operator    # skip this workload
+  - meet-celery-*          # wildcards supported (fnmatch)
 replacements:             # string replacements in generated files and env vars (port remaps are automatic now)
   - old: 'path_style_buckets = false'
     new: 'path_style_buckets = true'
@@ -117,6 +118,8 @@ CronJobs, init containers, sidecars (warning only — takes `containers[0]`), re
 
 - **Complexity refactoring** — Major functions refactored to reduce cyclomatic complexity: resolve_env (E→A), convert (D→B), _convert_volume_mounts (D→B), _build_alias_map (C→B), _build_service_port_map (C→B), _generate_secret_files (C→A), convert_workload (C→C), write_caddyfile (C→B). Shared helpers extracted (_index_workloads, _match_selector). Dead code removed (_get_network_aliases). Average complexity: B(8.59) → B(5.98).
 - **Lint cleanup** — Constants grouped at top of file. Unused function parameters removed. Broad `except Exception` narrowed to specific types. All file writes use explicit `encoding="utf-8"`. Pylint 9.56/10, pyflakes clean.
+- **Wildcard excludes** — `exclude:` patterns now support wildcards via `fnmatch` (e.g. `meet-celery-*`). Exact names still work.
+- **replicas: 0 auto-skip** — Workloads with `spec.replicas: 0` are automatically skipped with a warning (e.g. disabled AI services in meet). No need to manually exclude them.
 
 ## Known gaps / next steps
 
