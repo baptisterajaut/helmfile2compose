@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""helmfile2compose — convert helmfile template output to docker-compose.yml + Caddyfile."""
+"""helmfile2compose — convert helmfile template output to compose.yml + Caddyfile."""
 
 import argparse
 import base64
@@ -25,6 +25,9 @@ _K8S_DNS_RE = re.compile(
     r'(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.'       # namespace (discarded)
     r'svc\.cluster\.local'
 )
+
+# Placeholder for referencing secrets in overrides/custom services: $secret:<name>:<key>
+_SECRET_REF_RE = re.compile(r'\$secret:([^:]+):([^:}\s]+)')
 
 # K8s kinds we warn about (not convertible to compose)
 UNSUPPORTED_KINDS = (
@@ -96,6 +99,7 @@ def load_config(path: str) -> dict:
     else:
         cfg = {}
     cfg.setdefault("helmfile2ComposeVersion", "v1")
+    cfg.setdefault("volume_root", "./data")
     cfg.setdefault("volumes", {})
     cfg.setdefault("exclude", [])
     return cfg
@@ -129,6 +133,20 @@ def rewrite_k8s_dns(text: str) -> tuple[str, int]:
     return result, count
 
 
+def _resolve_host_path(host_path: str, volume_root: str) -> str:
+    """Resolve host_path: bare names are prefixed with volume_root, explicit paths kept as-is."""
+    if host_path.startswith(("/", "./", "../")):
+        return host_path
+    return f"{volume_root}/{host_path}"
+
+
+def _apply_replacements(text: str, replacements: list[dict]) -> str:
+    """Apply user-defined string replacements from config."""
+    for r in replacements:
+        text = text.replace(r["old"], r["new"])
+    return text
+
+
 def _secret_value(secret: dict, key: str) -> str | None:
     """Get a decoded value from a K8s Secret (base64 data or plain stringData)."""
     # stringData is plain text (rare in rendered output, but possible)
@@ -146,7 +164,8 @@ def _secret_value(secret: dict, key: str) -> str | None:
 
 
 def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
-                workload_name: str, warnings: list[str]) -> list[dict]:
+                workload_name: str, warnings: list[str],
+                replacements: list[dict] | None = None) -> list[dict]:
     """Resolve env and envFrom into a flat list of {name: ..., value: ...}."""
     env_vars: list[dict] = []
 
@@ -214,6 +233,12 @@ def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str,
             f"(*.svc.cluster.local → service name)"
         )
 
+    # Apply user-defined replacements
+    if replacements:
+        for ev in env_vars:
+            if ev["value"] is not None and isinstance(ev["value"], str):
+                ev["value"] = _apply_replacements(ev["value"], replacements)
+
     return env_vars
 
 
@@ -221,7 +246,8 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
                      services_by_selector: dict, pvc_names: set, config: dict,
                      warnings: list[str], output_dir: str = ".",
                      generated_cms: set | None = None,
-                     generated_secrets: set | None = None) -> dict | None:
+                     generated_secrets: set | None = None,
+                     replacements: list[dict] | None = None) -> dict | None:
     """Convert a Deployment or StatefulSet to a docker-compose service definition."""
     meta = manifest.get("metadata", {})
     name = meta.get("name", "unknown")
@@ -250,7 +276,7 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
             warnings.append(f"init container '{ic.get('name', '?')}' on {full} ignored — not supported")
 
     container = containers[0]
-    svc = {}
+    svc = {"restart": "always"}
 
     # Image
     image = container.get("image")
@@ -264,7 +290,8 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
         svc["command"] = container["args"]
 
     # Environment
-    env_list = resolve_env(container, configmaps, secrets, full, warnings)
+    env_list = resolve_env(container, configmaps, secrets, full, warnings,
+                           replacements=replacements)
     if env_list:
         svc["environment"] = {e["name"]: str(e["value"]) if e["value"] is not None else "" for e in env_list}
 
@@ -281,7 +308,8 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
     svc_volumes = _convert_volume_mounts(volume_mounts, pod_volumes, pvc_names, config, full, warnings,
                                          configmaps=configmaps, secrets=secrets,
                                          output_dir=output_dir, generated_cms=generated_cms,
-                                         generated_secrets=generated_secrets)
+                                         generated_secrets=generated_secrets,
+                                         replacements=replacements)
     if svc_volumes:
         svc["volumes"] = svc_volumes
 
@@ -344,7 +372,8 @@ def _get_network_aliases(workload_name: str, workload_labels: dict,
 
 
 def _generate_configmap_files(cm_name: str, cm_data: dict, output_dir: str,
-                              generated_cms: set, warnings: list[str]) -> str:
+                              generated_cms: set, warnings: list[str],
+                              replacements: list[dict] | None = None) -> str:
     """Write ConfigMap data entries as files. Returns the directory path (relative)."""
     rel_dir = os.path.join("configmaps", cm_name)
     abs_dir = os.path.join(output_dir, rel_dir)
@@ -357,6 +386,8 @@ def _generate_configmap_files(cm_name: str, cm_data: dict, output_dir: str,
                 warnings.append(
                     f"ConfigMap '{cm_name}' key '{key}': rewrote {count} K8s DNS reference(s)"
                 )
+            if replacements:
+                rewritten = _apply_replacements(rewritten, replacements)
             file_path = os.path.join(abs_dir, key)
             with open(file_path, "w") as f:
                 f.write(rewritten)
@@ -365,7 +396,8 @@ def _generate_configmap_files(cm_name: str, cm_data: dict, output_dir: str,
 
 def _generate_secret_files(sec_name: str, secret: dict, items: list | None,
                            output_dir: str, generated_secrets: set,
-                           warnings: list[str]) -> str:
+                           warnings: list[str],
+                           replacements: list[dict] | None = None) -> str:
     """Write Secret data entries as files. Returns the directory path (relative)."""
     rel_dir = os.path.join("secrets", sec_name)
     abs_dir = os.path.join(output_dir, rel_dir)
@@ -382,6 +414,8 @@ def _generate_secret_files(sec_name: str, secret: dict, items: list | None,
             if val is None:
                 warnings.append(f"Secret '{sec_name}' key '{key}' could not be decoded — skipped")
                 continue
+            if replacements:
+                val = _apply_replacements(val, replacements)
             # Determine output filename (items can remap key → path)
             out_name = key
             if items:
@@ -399,7 +433,8 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
                            config: dict, workload_name: str, warnings: list[str],
                            configmaps: dict | None = None, secrets: dict | None = None,
                            output_dir: str = ".", generated_cms: set | None = None,
-                           generated_secrets: set | None = None) -> list[str]:
+                           generated_secrets: set | None = None,
+                           replacements: list[dict] | None = None) -> list[str]:
     """Convert volumeMounts to docker-compose volume strings."""
     # Build a map of volume name → volume source
     vol_map = {}
@@ -429,7 +464,9 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
             pvc_names.add(claim)
             vol_cfg = config.get("volumes", {}).get(claim)
             if vol_cfg and isinstance(vol_cfg, dict) and "host_path" in vol_cfg:
-                result.append(f"{vol_cfg['host_path']}:{mount_path}")
+                resolved = _resolve_host_path(vol_cfg["host_path"],
+                                              config.get("volume_root", "./data"))
+                result.append(f"{resolved}:{mount_path}")
             elif vol_cfg is not None:
                 # Named volume
                 result.append(f"{claim}:{mount_path}")
@@ -448,7 +485,8 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
                 warnings.append(f"ConfigMap '{cm_name}' referenced by {workload_name} not found")
                 continue
             cm_dir = _generate_configmap_files(cm_name, cm.get("data", {}),
-                                               output_dir, generated_cms, warnings)
+                                               output_dir, generated_cms, warnings,
+                                               replacements=replacements)
             sub_path = vm.get("subPath")
             if sub_path:
                 result.append(f"{cm_dir}/{sub_path}:{mount_path}:ro")
@@ -461,7 +499,8 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
                 warnings.append(f"Secret '{sec_name}' referenced by {workload_name} not found")
                 continue
             sec_dir = _generate_secret_files(sec_name, sec, source.get("items"),
-                                             output_dir, generated_secrets, warnings)
+                                             output_dir, generated_secrets, warnings,
+                                             replacements=replacements)
             sub_path = vm.get("subPath")
             if sub_path:
                 result.append(f"{sec_dir}/{sub_path}:{mount_path}:ro")
@@ -511,9 +550,31 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
     return port_map
 
 
+def _extract_strip_prefix(annotations: dict, path: str) -> str | None:
+    """Extract a strip prefix from ingress rewrite annotations."""
+    # haproxy.org/path-rewrite: /api/(.*) /\1  →  strip "/api"
+    rewrite = annotations.get("haproxy.org/path-rewrite", "")
+    if rewrite:
+        parts = rewrite.split()
+        if len(parts) == 2 and parts[1] in (r"/\1", "/$1"):
+            # The prefix is the path without the regex capture group
+            prefix = re.sub(r'\(\.?\*\)$', '', parts[0])
+            if prefix and prefix != "/":
+                return prefix.rstrip("/")
+    # nginx.ingress.kubernetes.io/rewrite-target: /$1
+    rewrite = annotations.get("nginx.ingress.kubernetes.io/rewrite-target", "")
+    if rewrite in ("/$1", r"/\1"):
+        prefix = re.sub(r'\(\.?\*\)$', '', path)
+        if prefix and prefix != "/":
+            return prefix.rstrip("/")
+    return None
+
+
 def convert_ingress(manifest: dict, service_port_map: dict, warnings: list[str]) -> list[dict]:
     """Convert Ingress to Caddyfile entries."""
     entries = []
+    meta = manifest.get("metadata", {})
+    annotations = meta.get("annotations", {})
     spec = manifest.get("spec", {})
     rules = spec.get("rules", [])
     tls_hosts = set()
@@ -542,13 +603,48 @@ def convert_ingress(manifest: dict, service_port_map: dict, warnings: list[str])
             container_port = service_port_map.get((svc_name, svc_port), svc_port)
 
             scheme = "https" if host in tls_hosts else "http"
+            strip_prefix = _extract_strip_prefix(annotations, path)
             entries.append({
                 "host": host,
                 "path": path,
                 "upstream": f"{svc_name}:{container_port}",
                 "scheme": scheme,
+                "strip_prefix": strip_prefix,
             })
     return entries
+
+
+def _resolve_volume_root(obj, volume_root: str):
+    """Recursively resolve $volume_root placeholders in config values."""
+    if isinstance(obj, str):
+        return obj.replace("$volume_root", volume_root)
+    if isinstance(obj, list):
+        return [_resolve_volume_root(item, volume_root) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _resolve_volume_root(v, volume_root) for k, v in obj.items()}
+    return obj
+
+
+def _resolve_secret_refs(obj, secrets: dict, warnings: list[str]):
+    """Recursively resolve $secret:<name>:<key> placeholders in config values."""
+    if isinstance(obj, str):
+        def _replace(m):
+            sec_name, sec_key = m.group(1), m.group(2)
+            sec = secrets.get(sec_name)
+            if sec is None:
+                warnings.append(f"$secret ref: Secret '{sec_name}' not found")
+                return m.group(0)
+            val = _secret_value(sec, sec_key)
+            if val is None:
+                warnings.append(f"$secret ref: key '{sec_key}' not found in Secret '{sec_name}'")
+                return m.group(0)
+            return val
+        return _SECRET_REF_RE.sub(_replace, obj)
+    if isinstance(obj, list):
+        return [_resolve_secret_refs(item, secrets, warnings) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _resolve_secret_refs(v, secrets, warnings) for k, v in obj.items()}
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +682,9 @@ def convert(manifests: dict[str, list[dict]], config: dict,
             "ports": svc_spec.get("ports", []),
         }
 
+    # User-defined string replacements (applied to env vars and generated files)
+    replacements = config.get("replacements", [])
+
     # Convert workloads
     for kind in ("Deployment", "StatefulSet"):
         for m in manifests.get(kind, []):
@@ -593,7 +692,8 @@ def convert(manifests: dict[str, list[dict]], config: dict,
                                       pvc_names, config, warnings,
                                       output_dir=output_dir,
                                       generated_cms=generated_cms,
-                                      generated_secrets=generated_secrets)
+                                      generated_secrets=generated_secrets,
+                                      replacements=replacements)
             if result:
                 compose_services.update(result)
 
@@ -606,6 +706,7 @@ def convert(manifests: dict[str, list[dict]], config: dict,
     if caddy_entries:
         compose_services["caddy"] = {
             "image": "caddy:2-alpine",
+            "restart": "always",
             "ports": ["80:80", "443:443"],
             "volumes": [
                 "./Caddyfile:/etc/caddy/Caddyfile:ro",
@@ -614,10 +715,10 @@ def convert(manifests: dict[str, list[dict]], config: dict,
             ],
         }
 
-    # Update config with discovered PVCs
+    # Update config with discovered PVCs (default to host_path under volume_root)
     for pvc in sorted(pvc_names):
         if pvc not in config["volumes"]:
-            config["volumes"][pvc] = {"driver": "local"}
+            config["volumes"][pvc] = {"host_path": pvc}
 
     # Emit warnings for unsupported kinds
     for kind in UNSUPPORTED_KINDS:
@@ -631,6 +732,26 @@ def convert(manifests: dict[str, list[dict]], config: dict,
         if kind not in known:
             warnings.append(f"unknown kind '{kind}' ({len(items)} manifest(s)) — skipped")
 
+    # Apply service overrides from config (resolve $secret: and $volume_root refs)
+    volume_root = config.get("volume_root", "./data")
+    for svc_name, overrides in config.get("overrides", {}).items():
+        if svc_name not in compose_services:
+            warnings.append(f"override for '{svc_name}' but no such generated service — skipped")
+            continue
+        for key, val in overrides.items():
+            if val is None:
+                compose_services[svc_name].pop(key, None)
+            else:
+                resolved = _resolve_secret_refs(val, secrets, warnings)
+                compose_services[svc_name][key] = _resolve_volume_root(resolved, volume_root)
+
+    # Add custom services from config (resolve $secret: and $volume_root refs)
+    for svc_name, svc_def in config.get("services", {}).items():
+        if svc_name in compose_services:
+            warnings.append(f"custom service '{svc_name}' conflicts with generated service — overwritten")
+        resolved = _resolve_secret_refs(svc_def, secrets, warnings)
+        compose_services[svc_name] = _resolve_volume_root(resolved, volume_root)
+
     return compose_services, caddy_entries, warnings
 
 
@@ -638,8 +759,9 @@ def convert(manifests: dict[str, list[dict]], config: dict,
 # Output
 # ---------------------------------------------------------------------------
 
-def write_compose(services: dict, config: dict, output_dir: str) -> None:
-    """Write docker-compose.yml."""
+def write_compose(services: dict, config: dict, output_dir: str,
+                  compose_file: str = "compose.yml") -> None:
+    """Write compose file."""
     compose = {}
     if config.get("name"):
         compose["name"] = config["name"]
@@ -656,7 +778,7 @@ def write_compose(services: dict, config: dict, output_dir: str) -> None:
     if named_volumes:
         compose["volumes"] = named_volumes
 
-    path = os.path.join(output_dir, "docker-compose.yml")
+    path = os.path.join(output_dir, compose_file)
     with open(path, "w") as f:
         f.write("# Generated by helmfile2compose — do not edit manually\n")
         yaml.dump(compose, f, default_flow_style=False, sort_keys=False)
@@ -683,6 +805,8 @@ def write_caddyfile(entries: list[dict], output_dir: str) -> None:
             f.write(f"{host} {{\n")
             for entry in specific:
                 f.write(f"\thandle {entry['path']}* {{\n")
+                if entry.get("strip_prefix"):
+                    f.write(f"\t\turi strip_prefix {entry['strip_prefix']}\n")
                 f.write(f"\t\treverse_proxy {entry['upstream']}\n")
                 f.write("\t}\n")
             for entry in catchall:
@@ -702,8 +826,9 @@ def emit_warnings(warnings: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Convert helmfile template output to docker-compose.yml + Caddyfile"
+        description="Convert helmfile template output to compose.yml + Caddyfile"
     )
     parser.add_argument(
         "--helmfile-dir", default=".",
@@ -719,7 +844,11 @@ def main():
     )
     parser.add_argument(
         "--output-dir", default=".",
-        help="Where to write docker-compose.yml, Caddyfile, and helmfile2compose.yaml (default: .)",
+        help="Where to write compose.yml, Caddyfile, and helmfile2compose.yaml (default: .)",
+    )
+    parser.add_argument(
+        "--compose-file", default="compose.yml",
+        help="Name of the generated compose file (default: compose.yml)",
     )
     args = parser.parse_args()
 
@@ -771,7 +900,7 @@ def main():
         print("No services generated — nothing to write.", file=sys.stderr)
         sys.exit(1)
 
-    write_compose(services, config, args.output_dir)
+    write_compose(services, config, args.output_dir, compose_file=args.compose_file)
     write_caddyfile(caddy_entries, args.output_dir)
     save_config(config_path, config)
     print(f"Wrote {config_path}", file=sys.stderr)

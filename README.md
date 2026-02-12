@@ -6,9 +6,13 @@
 ![License](https://img.shields.io/badge/license-public%20domain-brightgreen)
 ![Vibe](https://img.shields.io/badge/vibe-coded-ff69b4)
 
-Convert `helmfile template` output to `docker-compose.yml` + `Caddyfile`.
+Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 
 Takes Kubernetes manifests rendered by helmfile and produces a working Docker Compose setup with Caddy as reverse proxy, so you can run your stack locally (or hobby-grade) without Kubernetes.
+
+**The generated `compose.yml` is a build artifact — never edit it directly.** All configuration goes in `helmfile2compose.yaml`; re-run the script to regenerate.
+
+Docker Compose is easy to understand but hard to maintain at scale. If you're running anything beyond a dev/hobby setup, you should really be using Kubernetes. This tool exists precisely so you don't have to maintain a compose by hand alongside your helmfile (or for my case, my community helmfiles).
 
 Vibe-coded with Claude, because maintaining two deployment systems by hand wasn't happening.
 
@@ -37,10 +41,11 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 | `-e`, `--environment` | Helmfile environment (e.g. `local`, `production`) |
 | `--from-dir` | Skip helmfile, read pre-rendered YAML from this directory |
 | `--output-dir` | Where to write output files (default: `.`) |
+| `--compose-file` | Name of the generated compose file (default: `compose.yml`) |
 
 ### Output files
 
-- `docker-compose.yml` -- services (incl. Caddy reverse proxy), volumes, network aliases
+- `compose.yml` -- services (incl. Caddy reverse proxy), volumes, network aliases
 - `Caddyfile` -- reverse proxy config derived from Ingress manifests
 - `helmfile2compose.yaml` -- persistent config (see below)
 - `configmaps/` -- generated files from ConfigMap volume mounts
@@ -54,7 +59,7 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 | ConfigMap / Secret | Resolved inline into `environment:` + generated as files for volume mounts |
 | Service (ClusterIP) | Network aliases on the compose service |
 | Service (NodePort / LoadBalancer) | `ports:` mapping |
-| Ingress | Caddy service + Caddyfile `reverse_proxy` blocks |
+| Ingress | Caddy service + Caddyfile `reverse_proxy` blocks (path-rewrite annotations → `uri strip_prefix`) |
 | PVC | Named volumes in `helmfile2compose.yaml` |
 
 ## Config file (`helmfile2compose.yaml`)
@@ -64,16 +69,50 @@ Created on first run, preserved across re-runs. Edit it to control volume mappin
 ```yaml
 helmfile2ComposeVersion: v1
 name: my-platform           # compose project name (default: source dir basename)
+volume_root: ./data         # prefix for bare host_path names (default: ./data)
 
 volumes:
   data-postgresql:
-    driver: local          # named volume
+    driver: local          # named docker volume
   myapp-data:
-    host_path: ./data/app  # bind mount
+    host_path: app         # → ./data/app (bare name = volume_root + name)
+  other:
+    host_path: ./custom    # explicit path (starts with ./ or /), used as-is
 
 exclude:
   - prometheus-operator    # skip this workload
+
+replacements:               # string replacements in generated files and env vars
+  - old: 'http://my-svc'
+    new: 'http://my-svc:8080'
+
+overrides:                  # shallow merge into generated services
+  redis-master:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "$secret:redis:redis-password"]
+    volumes: ["$volume_root/redis:/data"]
+    environment: null       # null deletes the key
+
+services:                   # custom services (not from K8s manifests)
+  minio-init:
+    image: quay.io/minio/mc:latest
+    restart: on-failure
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mc alias set local http://minio:9000 $secret:minio:rootUser $secret:minio:rootPassword
+        && mc mb --ignore-existing local/revolt-uploads
 ```
+
+### Config sections
+
+- **`volume_root`** — base path for volume host mounts (default: `./data`). Bare names in `host_path` are prefixed with this. Paths starting with `./` or `/` are used as-is. Auto-discovered PVCs default to `host_path: <pvc_name>` (resolved via `volume_root`).
+- **`volumes`** — map PVCs to named volumes or host paths.
+- **`exclude`** — skip workloads by name.
+- **`replacements`** — global find/replace in generated ConfigMap/Secret files and env vars. Useful when K8s Services remap ports (e.g. Service port 80 → container port 8080) — internal URLs like `http://my-svc` (implicit port 80) won't resolve in Compose without the actual container port.
+- **`overrides`** — shallow merge into generated services. Set a key to `null` to delete it. Useful for replacing bitnami images with vanilla ones, or injecting env vars.
+- **`services`** — add custom services not derived from K8s manifests. Combined with `restart: on-failure`, useful for one-shot init tasks (e.g. creating S3 buckets) that replace Helm post-install Jobs.
+- **`$secret:<name>:<key>`** — placeholder syntax in `overrides` and `services` values, resolved from K8s Secret manifests at generation time.
+- **`$volume_root`** — placeholder in `overrides` and `services` values, resolved to the `volume_root` config value.
 
 On first run, K8s-only workloads (matching `cert-manager`, `ingress`, `reflector`) are auto-excluded with a warning to review.
 
@@ -81,9 +120,15 @@ On first run, K8s-only workloads (matching `cert-manager`, `ingress`, `reflector
 
 ### [stoatchat-platform](https://github.com/baptisterajaut/stoatchat-platform)
 
-Primary target. A chat platform (Revolt rebrand) deployed via helmfile: API, events, file server, proxy, web client, MongoDB, Redis, RabbitMQ, MinIO, LiveKit.
+Primary target. A chat platform (Revolt rebrand) deployed via helmfile: API, events, file server, proxy, web client, MongoDB, Redis, RabbitMQ, MinIO, LiveKit. **15/15 services running** via helmfile2compose.
 
-Stoatchat-specific: all application services mount a `Revolt.toml` config file from a ConfigMap — now auto-generated to `configmaps/revolt-toml/Revolt.toml` and bind-mounted into each service. K8s internal DNS (`*.svc.cluster.local`) is rewritten to compose service names.
+Stoatchat-specific quirks handled via config:
+- All app services mount `Revolt.toml` from a ConfigMap → auto-generated + bind-mounted
+- K8s DNS (`*.svc.cluster.local`) rewritten to compose service names
+- Redis overridden from bitnami to vanilla (`overrides:` + `$secret:` ref)
+- MinIO bucket creation via one-shot `minio-init` service (`services:` + `restart: on-failure`)
+- LiveKit internal URL needs explicit port (`replacements:` — K8s Service port 80 → container 7880)
+- S3 `path_style_buckets` flipped to `true` via `replacements:` (compose DNS can't resolve virtual-hosted bucket URLs)
 
 ### [lasuite-platform](https://github.com/baptisterajaut/lasuite-platform)
 
@@ -100,3 +145,14 @@ Not converted (warning emitted):
 Silently ignored (no compose equivalent):
 - RBAC, ServiceAccounts, NetworkPolicies, CRDs, Certificates, Webhooks
 - Unknown kinds trigger a warning
+
+### Docker/Compose vs Kubernetes gotchas
+
+Some K8s features don't translate to Compose and may require helmfile-side adjustments for the local environment:
+
+- **Large port ranges** — K8s with `hostNetwork` handles thousands of ports natively. Docker creates one iptables/pf rule per port, so a range like 50000-60000 (e.g. LiveKit WebRTC) will kill your network stack. Reduce the range in your helmfile local values (e.g. 50000-50100).
+- **hostNetwork** — K8s pods can bind directly to the host network. In Compose, every exposed port must be mapped explicitly. Services relying on hostNetwork (e.g. LiveKit) need their ports listed in the Service/NodePort manifest or they won't be reachable.
+- **Pod-to-pod networking** — K8s gives each pod an IP; Compose uses a shared bridge network. This mostly works transparently (service names resolve), but multicast/broadcast or raw IP assumptions won't.
+- **S3 virtual-hosted style** — AWS SDKs default to virtual-hosted bucket URLs (`bucket-name.minio:9000`). Compose DNS can't resolve dotted hostnames as aliases. Configure your app to use path-style access (`minio:9000/bucket-name`) and use a `replacement` to flip the setting.
+- **Service port remapping** — K8s Services can remap ports (Service:80 → Pod:8080). In Compose there's no Service layer, so internal URLs using implicit port 80 won't work. Use `replacements:` to inject the actual container port.
+- **Helm post-install Jobs** — Jobs that initialize state (create buckets, run migrations) don't convert. Use the `services:` config section with `restart: on-failure` as a retry-until-ready pattern.
