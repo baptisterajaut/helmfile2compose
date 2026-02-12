@@ -8,7 +8,7 @@ Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` 
 
 ## What exists
 
-Single script `helmfile2compose.py` (~920 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~925 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -34,7 +34,7 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
   - **Ingress** → Caddy service + Caddyfile blocks (`reverse_proxy`), specific paths before catch-all
   - **PVC** → named volumes + `helmfile2compose.yaml` config
 - Warns on stderr for: init containers, sidecars, resource limits, HPA, CronJob, Job, PDB, unknown kinds
-- Silently ignores: RBAC, ServiceAccounts, NetworkPolicies, CRDs, Certificates, Webhooks, Namespaces
+- Silently ignores: RBAC, ServiceAccounts, NetworkPolicies, CRDs, Certificates (Certificate, ClusterIssuer, Issuer), IngressClass, Webhooks, Namespaces
 - Writes `compose.yml` (configurable via `--compose-file`), `Caddyfile`, `helmfile2compose.yaml`
 
 ### Config file (`helmfile2compose.yaml`)
@@ -45,6 +45,7 @@ Persistent, re-runnable. User edits are preserved across runs.
 helmfile2ComposeVersion: v1
 name: my-platform
 volume_root: ./data        # prefix for bare host_path names (default: ./data)
+caddy_email: admin@example.com  # optional — for Caddy automatic HTTPS
 volumes:
   data-postgresql:
     driver: local          # named docker volume
@@ -75,6 +76,7 @@ services:                 # custom services added to compose (not from K8s)
 
 - `$secret:<name>:<key>` — placeholders in `overrides` and `services` values, resolved from K8s Secret manifests at generation time. `null` values in overrides delete the key.
 - `$volume_root` — placeholder in `overrides` and `services` values, resolved to the `volume_root` config value. Keeps all paths relative to a single configurable root.
+- `caddy_email` — optional. If set, generates a global Caddy block `{ email <value> }` for automatic HTTPS certificate provisioning.
 
 ### Tested with
 
