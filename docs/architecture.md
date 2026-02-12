@@ -18,19 +18,20 @@ A dedicated helmfile environment (e.g. `compose`) typically disables K8s-only in
 
 | K8s kind | Compose equivalent |
 |----------|-------------------|
-| Deployment / StatefulSet | `services:` (image, env, command, volumes, ports) |
-| Job | `services:` with `restart: on-failure` (migrations, superuser creation) |
+| Deployment / StatefulSet | `services:` (image, env, command, volumes, ports). Init containers become separate services with `restart: on-failure`. |
+| Job | `services:` with `restart: on-failure` (migrations, superuser creation). Init containers converted the same way. |
 | ConfigMap / Secret | Resolved inline into `environment:` + generated as files for volume mounts |
 | Service (ClusterIP) | Hostname rewriting (K8s Service name → compose service name) |
 | Service (ExternalName) | Resolved through alias chain (e.g. `docs-media` → minio) |
 | Service (NodePort / LoadBalancer) | `ports:` mapping |
 | Ingress | Caddy service + Caddyfile `reverse_proxy` blocks (path-rewrite annotations → `uri strip_prefix`) |
-| PVC | Named volumes in `helmfile2compose.yaml` |
+| PVC / volumeClaimTemplates | Host-path bind mounts (auto-registered in `helmfile2compose.yaml`) |
+| securityContext (runAsUser) | Auto-generated `fix-permissions` service (`chown -R <uid>`) for non-root bind mounts |
 
 ### Not converted (warning emitted)
 
 - CronJobs
-- Init containers, sidecars (takes `containers[0]` only)
+- Sidecars (takes `containers[0]` only)
 - Resource limits / requests, HPA, PDB
 
 ### Silently ignored (no compose equivalent)
@@ -120,6 +121,7 @@ On first run, K8s-only workloads (matching `cert-manager`, `ingress`, `reflector
 
 Some K8s features don't translate to Compose and may require helmfile-side adjustments:
 
+- **No `depends_on` enforcement** — nerdctl compose ignores `depends_on` entirely, and even Docker compose `condition: service_completed_successfully` is fragile across runtimes. That's why Jobs (migrations, bucket init) are converted with `restart: on-failure` instead of dependency ordering — they just retry until the dependency is ready. Brute force, but it works everywhere. Init containers will follow the same pattern when supported.
 - **Large port ranges** — K8s with `hostNetwork` handles thousands of ports natively. Docker creates one iptables/pf rule per port, so a range like 50000-60000 (e.g. WebRTC) will kill your network stack. Reduce the range in your compose environment values (e.g. 50000-50100).
 - **hostNetwork** — K8s pods can bind directly to the host network. In Compose, every exposed port must be mapped explicitly.
 - **Pod-to-pod networking** — K8s gives each pod an IP; Compose uses a shared bridge network. This mostly works transparently, but multicast/broadcast or raw IP assumptions won't.

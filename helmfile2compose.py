@@ -364,12 +364,10 @@ def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str,
     return env_vars
 
 
-def _emit_container_warnings(pod_spec: dict, full: str, warnings: list[str]) -> None:
-    """Warn about sidecars and init containers that aren't converted."""
+def _emit_sidecar_warnings(pod_spec: dict, full: str, warnings: list[str]) -> None:
+    """Warn about sidecars that aren't converted."""
     for c in pod_spec.get("containers", [])[1:]:
         warnings.append(f"sidecar container '{c.get('name', '?')}' on {full} ignored — only main container converted")
-    for ic in pod_spec.get("initContainers", []):
-        warnings.append(f"init container '{ic.get('name', '?')}' on {full} ignored — not supported")
 
 
 def _convert_command(container: dict, env_dict: dict[str, str]) -> dict:
@@ -384,6 +382,70 @@ def _convert_command(container: dict, env_dict: dict[str, str]) -> dict:
     return result
 
 
+def _get_run_as_user(pod_spec: dict, container: dict) -> int | None:
+    """Extract runAsUser from container or pod securityContext (container wins)."""
+    for ctx in (container.get("securityContext", {}), pod_spec.get("securityContext", {})):
+        uid = ctx.get("runAsUser")
+        if uid is not None:
+            return int(uid)
+    return None
+
+
+def _convert_init_containers(pod_spec: dict, name: str, config: dict,
+                             pvc_names: set, warnings: list[str],
+                             vcts: list | None = None, **kwargs) -> dict:
+    """Convert init containers to separate compose services with restart: on-failure."""
+    result = {}
+    for ic in pod_spec.get("initContainers", []):
+        ic_name = ic.get("name", "init")
+        ic_svc_name = f"{name}-init-{ic_name}"
+        ic_full = f"initContainer/{ic_svc_name}"
+        if _is_excluded(ic_svc_name, config.get("exclude", [])):
+            continue
+        ic_svc = {"restart": "on-failure"}
+        if ic.get("image"):
+            ic_svc["image"] = ic["image"]
+        ic_env_list = resolve_env(ic, kwargs["configmaps"], kwargs["secrets"], ic_full, warnings,
+                                  replacements=kwargs.get("replacements"),
+                                  alias_map=kwargs.get("alias_map"),
+                                  service_port_map=kwargs.get("service_port_map"))
+        ic_env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
+                       for e in ic_env_list}
+        ic_svc.update(_convert_command(ic, ic_env_dict))
+        if ic_env_dict:
+            ic_svc["environment"] = ic_env_dict
+        ic_volumes = _convert_volume_mounts(
+            ic.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+            pvc_names, config, ic_full, warnings, configmaps=kwargs.get("configmaps"),
+            secrets=kwargs.get("secrets"), output_dir=kwargs.get("output_dir", "."),
+            generated_cms=kwargs.get("generated_cms"),
+            generated_secrets=kwargs.get("generated_secrets"),
+            replacements=kwargs.get("replacements"),
+            alias_map=kwargs.get("alias_map"),
+            service_port_map=kwargs.get("service_port_map"),
+            volume_claim_templates=vcts)
+        if ic_volumes:
+            ic_svc["volumes"] = ic_volumes
+        result[ic_svc_name] = ic_svc
+    return result
+
+
+def _collect_fix_permissions(pod_spec: dict, container: dict,
+                             fix_permissions: dict | None,
+                             vcts: list | None = None) -> None:
+    """Collect PVC claims needing permission fixes for non-root containers."""
+    if fix_permissions is None:
+        return
+    uid = _get_run_as_user(pod_spec, container)
+    if not uid or uid <= 0:
+        return
+    vol_map = _build_vol_map(pod_spec.get("volumes") or [], vcts)
+    for vm in container.get("volumeMounts") or []:
+        source = vol_map.get(vm.get("name", ""), {})
+        if source.get("type") == "pvc":
+            fix_permissions[source["claim"]] = uid
+
+
 def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
                      services_by_selector: dict, pvc_names: set, config: dict,
                      warnings: list[str], output_dir: str = ".",
@@ -392,7 +454,8 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
                      replacements: list[dict] | None = None,
                      alias_map: dict[str, str] | None = None,
                      service_port_map: dict | None = None,
-                     restart_policy: str = "always") -> dict | None:
+                     restart_policy: str = "always",
+                     fix_permissions: dict | None = None) -> dict | None:
     """Convert a Deployment, StatefulSet, or Job to a docker-compose service definition."""
     meta = manifest.get("metadata", {})
     name = meta.get("name", "unknown")
@@ -407,14 +470,24 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
         warnings.append(f"{full} has replicas: 0 — skipped")
         return None
 
-    pod_spec = manifest.get("spec", {}).get("template", {}).get("spec", {})
+    spec = manifest.get("spec", {})
+    pod_spec = spec.get("template", {}).get("spec", {})
+    vcts = spec.get("volumeClaimTemplates")  # StatefulSet only
     containers = pod_spec.get("containers", [])
     if not containers:
         warnings.append(f"{full} has no containers — skipped")
         return None
 
-    _emit_container_warnings(pod_spec, full, warnings)
+    _emit_sidecar_warnings(pod_spec, full, warnings)
     container = containers[0]
+
+    result = _convert_init_containers(
+        pod_spec, name, config, pvc_names, warnings, vcts=vcts,
+        configmaps=configmaps, secrets=secrets, output_dir=output_dir,
+        generated_cms=generated_cms, generated_secrets=generated_secrets,
+        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
+
+    # --- Main container ---
     svc = {"restart": restart_policy}
 
     if container.get("image"):
@@ -441,7 +514,8 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
         container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
         pvc_names, config, full, warnings, configmaps=configmaps, secrets=secrets,
         output_dir=output_dir, generated_cms=generated_cms, generated_secrets=generated_secrets,
-        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
+        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map,
+        volume_claim_templates=vcts)
     if svc_volumes:
         svc["volumes"] = svc_volumes
 
@@ -449,7 +523,10 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
     if resources.get("limits") or resources.get("requests"):
         warnings.append(f"resource limits on {full} ignored")
 
-    return {name: svc}
+    _collect_fix_permissions(pod_spec, container, fix_permissions, vcts)
+
+    result[name] = svc
+    return result
 
 
 def _resolve_named_port(name: str, container_ports: list) -> int | str:
@@ -604,9 +681,18 @@ def _generate_secret_files(sec_name: str, secret: dict, items: list | None,
     return f"./{rel_dir}"
 
 
-def _build_vol_map(pod_volumes: list) -> dict:
-    """Build a map of volume name → volume source from pod spec volumes."""
+def _build_vol_map(pod_volumes: list,
+                    volume_claim_templates: list | None = None) -> dict:
+    """Build a map of volume name → volume source from pod spec volumes.
+
+    For StatefulSets, volumeClaimTemplates define implicit PVC volumes
+    whose name matches the template metadata.name.
+    """
     vol_map = {}
+    for vct in (volume_claim_templates or []):
+        vname = vct.get("metadata", {}).get("name", "")
+        if vname:
+            vol_map[vname] = {"type": "pvc", "claim": vname}
     for v in pod_volumes:
         vname = v.get("name", "")
         if "persistentVolumeClaim" in v:
@@ -654,9 +740,10 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
                            generated_secrets: set | None = None,
                            replacements: list[dict] | None = None,
                            alias_map: dict[str, str] | None = None,
-                           service_port_map: dict | None = None) -> list[str]:
+                           service_port_map: dict | None = None,
+                           volume_claim_templates: list | None = None) -> list[str]:
     """Convert volumeMounts to docker-compose volume strings."""
-    vol_map = _build_vol_map(pod_volumes)
+    vol_map = _build_vol_map(pod_volumes, volume_claim_templates)
     result = []
     for vm in volume_mounts:
         source = vol_map.get(vm.get("name", ""), {})
@@ -872,6 +959,38 @@ def _apply_overrides(compose_services: dict, config: dict,
         compose_services[svc_name] = _resolve_volume_root(resolved, volume_root)
 
 
+def _generate_fix_permissions(fix_permissions: dict[str, int],
+                              config: dict, compose_services: dict) -> None:
+    """Generate a fix-permissions service for non-root bind-mounted volumes.
+
+    fix_permissions maps PVC claim names to UIDs. Only PVCs with host_path
+    binds (not named volumes) need fixing.
+    """
+    if not fix_permissions:
+        return
+    volume_root = config.get("volume_root", "./data")
+    by_uid: dict[int, list[str]] = {}
+    for claim, uid in sorted(fix_permissions.items()):
+        vol_cfg = config.get("volumes", {}).get(claim)
+        if vol_cfg and isinstance(vol_cfg, dict) and "host_path" in vol_cfg:
+            resolved = _resolve_host_path(vol_cfg["host_path"], volume_root)
+            by_uid.setdefault(uid, []).append(resolved)
+    if not by_uid:
+        return
+    chown_cmds = []
+    volumes = []
+    for uid, paths in sorted(by_uid.items()):
+        mount_paths = [f"/fixperm/{i}" for i in range(len(volumes), len(volumes) + len(paths))]
+        chown_cmds.append(f"chown -R {uid} {' '.join(mount_paths)}")
+        for host_path, mount_path in zip(paths, mount_paths):
+            volumes.append(f"{host_path}:{mount_path}")
+    compose_services["fix-permissions"] = {
+        "image": "busybox", "restart": "no", "user": "0",
+        "command": ["sh", "-c", " && ".join(chown_cmds)],
+        "volumes": volumes,
+    }
+
+
 def _emit_kind_warnings(manifests: dict, warnings: list[str]) -> None:
     """Emit warnings for unsupported and unknown manifest kinds."""
     for kind in UNSUPPORTED_KINDS:
@@ -898,13 +1017,35 @@ def convert(manifests: dict[str, list[dict]], config: dict,
     alias_map = _build_alias_map(manifests, services_by_selector)
     service_port_map = _build_service_port_map(manifests, services_by_selector)
 
+    fix_permissions: dict[str, int] = {}  # {pvc_claim: uid}
+
+    # Pre-register PVCs so _convert_pvc_mount can resolve host_path on first run
+    for kind in ("Deployment", "StatefulSet"):
+        for m in manifests.get(kind, []):
+            spec = m.get("spec", {})
+            # StatefulSet volumeClaimTemplates
+            for vct in spec.get("volumeClaimTemplates", []):
+                claim = vct.get("metadata", {}).get("name", "")
+                if claim and claim not in config.get("volumes", {}):
+                    config.setdefault("volumes", {})[claim] = {"host_path": claim}
+                    pvc_names.add(claim)
+            # Regular PVC references in pod volumes
+            pod_vols = spec.get("template", {}).get("spec", {}).get("volumes") or []
+            for v in pod_vols:
+                pvc = v.get("persistentVolumeClaim", {})
+                claim = pvc.get("claimName", "")
+                if claim and claim not in config.get("volumes", {}):
+                    config.setdefault("volumes", {})[claim] = {"host_path": claim}
+                    pvc_names.add(claim)
+
     # Shared kwargs for convert_workload calls
     wl_kwargs = {"configmaps": configmaps, "secrets": secrets,
                   "services_by_selector": services_by_selector,
                   "pvc_names": pvc_names, "config": config, "warnings": warnings,
                   "output_dir": output_dir, "generated_cms": generated_cms,
                   "generated_secrets": generated_secrets, "replacements": replacements,
-                  "alias_map": alias_map, "service_port_map": service_port_map}
+                  "alias_map": alias_map, "service_port_map": service_port_map,
+                  "fix_permissions": fix_permissions}
 
     # Convert workloads (Deployments, StatefulSets, Jobs)
     for kind in ("Deployment", "StatefulSet"):
@@ -934,6 +1075,7 @@ def convert(manifests: dict[str, list[dict]], config: dict,
         if pvc not in config["volumes"]:
             config["volumes"][pvc] = {"host_path": pvc}
 
+    _generate_fix_permissions(fix_permissions, config, compose_services)
     _emit_kind_warnings(manifests, warnings)
     _apply_overrides(compose_services, config, secrets, warnings)
 

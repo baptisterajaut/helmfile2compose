@@ -92,7 +92,7 @@ services:                 # custom services added to compose (not from K8s)
 
 ## Out of scope (MVP)
 
-CronJobs, init containers, sidecars (warning only — takes `containers[0]`), resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPolicies, probes→healthcheck.
+CronJobs, sidecars (warning only — takes `containers[0]`), resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPolicies, probes→healthcheck.
 
 ## Recent fixes
 
@@ -120,6 +120,10 @@ CronJobs, init containers, sidecars (warning only — takes `containers[0]`), re
 - **Lint cleanup** — Constants grouped at top of file. Unused function parameters removed. Broad `except Exception` narrowed to specific types. All file writes use explicit `encoding="utf-8"`. Pylint 9.56/10, pyflakes clean.
 - **Wildcard excludes** — `exclude:` patterns now support wildcards via `fnmatch` (e.g. `meet-celery-*`). Exact names still work.
 - **replicas: 0 auto-skip** — Workloads with `spec.replicas: 0` are automatically skipped with a warning (e.g. disabled AI services in meet). No need to manually exclude them.
+- **Init container conversion** — K8s init containers converted to separate compose services with `restart: on-failure`, named `{workload}-init-{container-name}`. Same brute-force retry pattern as Jobs. Shares pod-level volumes (PVC, ConfigMap, Secret) but not emptyDir (anonymous volumes, not shared between compose services).
+- **volumeClaimTemplates** — StatefulSet VCTs now registered as PVC volumes. Previously only `persistentVolumeClaim` references in pod volumes were handled.
+- **PVC pre-registration** — PVCs from both regular volumes and VCTs are pre-registered in config before workload conversion. Fixes first-run where PVCs were discovered too late and rendered as named volumes instead of host_path bind mounts.
+- **Automatic fix-permissions** — Non-root containers (`securityContext.runAsUser > 0`) with PVC bind mounts automatically generate a `fix-permissions` service (busybox, root, `chown -R <uid>`) in compose.yml. No manual config needed. Fixes Bitnami images (PostgreSQL UID 1001, Redis UID 1001, MongoDB UID 1001) failing with `permission denied` on host-mounted data directories.
 
 ## Known gaps / next steps
 
