@@ -49,6 +49,12 @@ CONVERTED_KINDS = (
     "Service", "Ingress", "PersistentVolumeClaim",
 )
 
+# K8s $(VAR) interpolation in command/args (kubelet resolves these from env vars)
+_K8S_VAR_REF_RE = re.compile(r'\$\(([A-Za-z_][A-Za-z0-9_]*)\)')
+
+# Regex boundary for URL port rewriting (matches end-of-string or path/whitespace/quote)
+_URL_BOUNDARY = r'''(?=[/\s"']|$)'''
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -113,7 +119,7 @@ def save_config(path: str, config: dict) -> None:
     for k, v in config.items():
         if k != "helmfile2ComposeVersion":
             ordered[k] = v
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(header)
         yaml.dump(ordered, f, default_flow_style=False, sort_keys=False)
 
@@ -123,6 +129,7 @@ def save_config(path: str, config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _full_name(manifest: dict) -> str:
+    """Return 'Kind/name' string for use in warning messages."""
     meta = manifest.get("metadata", {})
     return f"{manifest.get('kind', '?')}/{meta.get('name', '?')}"
 
@@ -145,12 +152,6 @@ def _apply_replacements(text: str, replacements: list[dict]) -> str:
     for r in replacements:
         text = text.replace(r["old"], r["new"])
     return text
-
-
-# K8s $(VAR) interpolation in command/args (kubelet resolves these from env vars)
-_K8S_VAR_REF_RE = re.compile(r'\$\(([A-Za-z_][A-Za-z0-9_]*)\)')
-
-_URL_BOUNDARY = r'''(?=[/\s"']|$)'''
 
 
 def _apply_port_remap(text: str, service_port_map: dict) -> str:
@@ -247,70 +248,68 @@ def _secret_value(secret: dict, key: str) -> str | None:
     if val is not None:
         try:
             return base64.b64decode(val).decode("utf-8")
-        except Exception:
+        except (ValueError, UnicodeDecodeError):
             return val  # fallback: return raw if decode fails
     return None
 
 
-def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
-                workload_name: str, warnings: list[str],
-                replacements: list[dict] | None = None,
-                alias_map: dict[str, str] | None = None,
-                service_port_map: dict | None = None) -> list[dict]:
-    """Resolve env and envFrom into a flat list of {name: ..., value: ...}."""
+def _resolve_env_entry(entry: dict, configmaps: dict, secrets: dict,
+                       workload_name: str, warnings: list[str]) -> dict | None:
+    """Resolve a single K8s env entry (value, configMapKeyRef, or secretKeyRef)."""
+    name = entry.get("name", "")
+    if "value" in entry:
+        return {"name": name, "value": entry["value"]}
+    if "valueFrom" not in entry:
+        return None
+    vf = entry["valueFrom"]
+    if "configMapKeyRef" in vf:
+        ref = vf["configMapKeyRef"]
+        val = configmaps.get(ref.get("name", ""), {}).get("data", {}).get(ref.get("key", ""))
+        if val is not None:
+            return {"name": name, "value": val}
+        warnings.append(
+            f"configMapKeyRef '{ref.get('name')}/{ref.get('key')}' "
+            f"on {workload_name} could not be resolved"
+        )
+    elif "secretKeyRef" in vf:
+        ref = vf["secretKeyRef"]
+        val = _secret_value(secrets.get(ref.get("name", ""), {}), ref.get("key", ""))
+        if val is not None:
+            return {"name": name, "value": val}
+        warnings.append(
+            f"secretKeyRef '{ref.get('name')}/{ref.get('key')}' "
+            f"on {workload_name} could not be resolved"
+        )
+    else:
+        warnings.append(
+            f"env var '{name}' on {workload_name} uses unsupported valueFrom — skipped"
+        )
+    return None
+
+
+def _resolve_envfrom(envfrom_list: list, configmaps: dict, secrets: dict) -> list[dict]:
+    """Resolve envFrom entries (configMapRef, secretRef) into flat env vars."""
     env_vars: list[dict] = []
-
-    # Direct env entries
-    for e in (container.get("env") or []):
-        name = e.get("name", "")
-        if "value" in e:
-            env_vars.append({"name": name, "value": e["value"]})
-        elif "valueFrom" in e:
-            vf = e["valueFrom"]
-            if "configMapKeyRef" in vf:
-                ref = vf["configMapKeyRef"]
-                cm = configmaps.get(ref.get("name", ""), {})
-                data = cm.get("data", {})
-                val = data.get(ref.get("key", ""))
-                if val is not None:
-                    env_vars.append({"name": name, "value": val})
-                else:
-                    warnings.append(
-                        f"configMapKeyRef '{ref.get('name')}/{ref.get('key')}' "
-                        f"on {workload_name} could not be resolved"
-                    )
-            elif "secretKeyRef" in vf:
-                ref = vf["secretKeyRef"]
-                sec = secrets.get(ref.get("name", ""), {})
-                val = _secret_value(sec, ref.get("key", ""))
-                if val is not None:
-                    env_vars.append({"name": name, "value": val})
-                else:
-                    warnings.append(
-                        f"secretKeyRef '{ref.get('name')}/{ref.get('key')}' "
-                        f"on {workload_name} could not be resolved"
-                    )
-            else:
-                warnings.append(
-                    f"env var '{name}' on {workload_name} uses unsupported valueFrom — skipped"
-                )
-
-    # envFrom entries
-    for ef in (container.get("envFrom") or []):
+    for ef in envfrom_list:
         if "configMapRef" in ef:
-            cm_name = ef["configMapRef"].get("name", "")
-            cm = configmaps.get(cm_name, {})
+            cm = configmaps.get(ef["configMapRef"].get("name", ""), {})
             for k, v in cm.get("data", {}).items():
                 env_vars.append({"name": k, "value": v})
         elif "secretRef" in ef:
-            sec_name = ef["secretRef"].get("name", "")
-            sec = secrets.get(sec_name, {})
+            sec = secrets.get(ef["secretRef"].get("name", ""), {})
             for k in sec.get("data", {}):
                 val = _secret_value(sec, k)
                 if val is not None:
                     env_vars.append({"name": k, "value": val})
+    return env_vars
 
-    # Rewrite K8s internal DNS in env var values
+
+def _rewrite_env_values(env_vars: list[dict], workload_name: str, warnings: list[str],
+                        replacements: list[dict] | None = None,
+                        alias_map: dict[str, str] | None = None,
+                        service_port_map: dict | None = None) -> None:
+    """Apply DNS rewriting, port remapping, alias resolution, and replacements to env values."""
+    # Rewrite K8s internal DNS
     total_rewrites = 0
     for ev in env_vars:
         if ev["value"] is not None and isinstance(ev["value"], str):
@@ -324,25 +323,59 @@ def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str,
             f"(*.svc.cluster.local → service name)"
         )
 
-    # Remap K8s Service ports → container ports
+    # Apply transforms: port remap → alias resolve → user replacements
+    transforms = []
     if service_port_map:
-        for ev in env_vars:
-            if ev["value"] is not None and isinstance(ev["value"], str):
-                ev["value"] = _apply_port_remap(ev["value"], service_port_map)
-
-    # Resolve K8s Service names → compose service names
+        transforms.append(lambda v: _apply_port_remap(v, service_port_map))
     if alias_map:
-        for ev in env_vars:
-            if ev["value"] is not None and isinstance(ev["value"], str):
-                ev["value"] = _apply_alias_map(ev["value"], alias_map)
-
-    # Apply user-defined replacements
+        transforms.append(lambda v: _apply_alias_map(v, alias_map))
     if replacements:
-        for ev in env_vars:
-            if ev["value"] is not None and isinstance(ev["value"], str):
-                ev["value"] = _apply_replacements(ev["value"], replacements)
+        transforms.append(lambda v: _apply_replacements(v, replacements))
+    for ev in env_vars:
+        if ev["value"] is not None and isinstance(ev["value"], str):
+            for transform in transforms:
+                ev["value"] = transform(ev["value"])
 
+
+def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
+                workload_name: str, warnings: list[str],
+                replacements: list[dict] | None = None,
+                alias_map: dict[str, str] | None = None,
+                service_port_map: dict | None = None) -> list[dict]:
+    """Resolve env and envFrom into a flat list of {name: ..., value: ...}."""
+    env_vars: list[dict] = []
+
+    for e in (container.get("env") or []):
+        resolved = _resolve_env_entry(e, configmaps, secrets, workload_name, warnings)
+        if resolved:
+            env_vars.append(resolved)
+
+    env_vars.extend(_resolve_envfrom(container.get("envFrom") or [], configmaps, secrets))
+
+    _rewrite_env_values(env_vars, workload_name, warnings,
+                        replacements=replacements, alias_map=alias_map,
+                        service_port_map=service_port_map)
     return env_vars
+
+
+def _emit_container_warnings(pod_spec: dict, full: str, warnings: list[str]) -> None:
+    """Warn about sidecars and init containers that aren't converted."""
+    for c in pod_spec.get("containers", [])[1:]:
+        warnings.append(f"sidecar container '{c.get('name', '?')}' on {full} ignored — only main container converted")
+    for ic in pod_spec.get("initContainers", []):
+        warnings.append(f"init container '{ic.get('name', '?')}' on {full} ignored — not supported")
+
+
+def _convert_command(container: dict, env_dict: dict[str, str]) -> dict:
+    """Convert K8s command/args to compose entrypoint/command with variable resolution."""
+    result = {}
+    if "command" in container:
+        resolved = _resolve_k8s_var_refs(container["command"], env_dict)
+        result["entrypoint"] = _escape_shell_vars_for_compose(resolved)
+    if "args" in container:
+        resolved = _resolve_k8s_var_refs(container["args"], env_dict)
+        result["command"] = _escape_shell_vars_for_compose(resolved)
+    return result
 
 
 def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
@@ -354,40 +387,26 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
                      alias_map: dict[str, str] | None = None,
                      service_port_map: dict | None = None,
                      restart_policy: str = "always") -> dict | None:
-    """Convert a Deployment or StatefulSet to a docker-compose service definition."""
+    """Convert a Deployment, StatefulSet, or Job to a docker-compose service definition."""
     meta = manifest.get("metadata", {})
     name = meta.get("name", "unknown")
-    kind = manifest.get("kind", "?")
-    full = f"{kind}/{name}"
+    full = f"{manifest.get('kind', '?')}/{name}"
 
     if name in config.get("exclude", []):
         return None
 
-    spec = manifest.get("spec", {})
-    pod_spec = spec.get("template", {}).get("spec", {})
+    pod_spec = manifest.get("spec", {}).get("template", {}).get("spec", {})
     containers = pod_spec.get("containers", [])
-    init_containers = pod_spec.get("initContainers", [])
-
     if not containers:
         warnings.append(f"{full} has no containers — skipped")
         return None
 
-    if len(containers) > 1:
-        sidecars = [c.get("name", "?") for c in containers[1:]]
-        for sc in sidecars:
-            warnings.append(f"sidecar container '{sc}' on {full} ignored — only main container converted")
-
-    if init_containers:
-        for ic in init_containers:
-            warnings.append(f"init container '{ic.get('name', '?')}' on {full} ignored — not supported")
-
+    _emit_container_warnings(pod_spec, full, warnings)
     container = containers[0]
     svc = {"restart": restart_policy}
 
-    # Image
-    image = container.get("image")
-    if image:
-        svc["image"] = image
+    if container.get("image"):
+        svc["image"] = container["image"]
 
     # Environment (resolve before command so $(VAR) refs can be inlined)
     env_list = resolve_env(container, configmaps, secrets, full, warnings,
@@ -395,38 +414,25 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
                            service_port_map=service_port_map)
     env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else "" for e in env_list}
 
-    # Command / entrypoint: resolve K8s $(VAR) refs, then escape $VAR for compose
-    if "command" in container:
-        resolved = _resolve_k8s_var_refs(container["command"], env_dict)
-        svc["entrypoint"] = _escape_shell_vars_for_compose(resolved)
-    if "args" in container:
-        resolved = _resolve_k8s_var_refs(container["args"], env_dict)
-        svc["command"] = _escape_shell_vars_for_compose(resolved)
-
+    svc.update(_convert_command(container, env_dict))
     if env_dict:
         svc["environment"] = env_dict
 
-    # Ports — only expose if matching K8s Service is NodePort/LoadBalancer
-    container_ports = container.get("ports", [])
-    exposed_ports = _get_exposed_ports(name, meta.get("labels", {}), container_ports,
-                                       services_by_selector)
+    # Ports
+    exposed_ports = _get_exposed_ports(meta.get("labels", {}),
+                                       container.get("ports", []), services_by_selector)
     if exposed_ports:
         svc["ports"] = exposed_ports
 
     # Volumes
-    volume_mounts = container.get("volumeMounts") or []
-    pod_volumes = pod_spec.get("volumes") or []
-    svc_volumes = _convert_volume_mounts(volume_mounts, pod_volumes, pvc_names, config, full, warnings,
-                                         configmaps=configmaps, secrets=secrets,
-                                         output_dir=output_dir, generated_cms=generated_cms,
-                                         generated_secrets=generated_secrets,
-                                         replacements=replacements,
-                                         alias_map=alias_map,
-                                         service_port_map=service_port_map)
+    svc_volumes = _convert_volume_mounts(
+        container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+        pvc_names, config, full, warnings, configmaps=configmaps, secrets=secrets,
+        output_dir=output_dir, generated_cms=generated_cms, generated_secrets=generated_secrets,
+        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
     if svc_volumes:
         svc["volumes"] = svc_volumes
 
-    # Resource limits warning
     resources = container.get("resources", {})
     if resources.get("limits") or resources.get("requests"):
         warnings.append(f"resource limits on {full} ignored")
@@ -442,7 +448,7 @@ def _resolve_named_port(name: str, container_ports: list) -> int | str:
     return name  # fallback: return as-is if not found
 
 
-def _get_exposed_ports(workload_name: str, workload_labels: dict, container_ports: list,
+def _get_exposed_ports(workload_labels: dict, container_ports: list,
                        services_by_selector: dict) -> list[str]:
     """Determine which ports to expose based on K8s Service type."""
     ports = []
@@ -464,19 +470,23 @@ def _get_exposed_ports(workload_name: str, workload_labels: dict, container_port
     return ports
 
 
-def _get_network_aliases(workload_name: str, workload_labels: dict,
-                         services_by_selector: dict) -> list[str]:
-    """Get network aliases from K8s Services that select this workload."""
-    aliases = []
-    for _sel_key, svc_info in services_by_selector.items():
-        svc_labels = svc_info.get("selector", {})
-        if not svc_labels:
-            continue
-        if all(workload_labels.get(k) == v for k, v in svc_labels.items()):
-            svc_name = svc_info.get("name", "")
-            if svc_name and svc_name != workload_name:
-                aliases.append(svc_name)
-    return aliases
+
+def _index_workloads(manifests: dict) -> list[tuple[dict, str]]:
+    """Index workload labels → workload name for Deployments and StatefulSets."""
+    result = []
+    for kind in ("Deployment", "StatefulSet"):
+        for m in manifests.get(kind, []):
+            meta = m.get("metadata", {})
+            result.append((meta.get("labels", {}), meta.get("name", "")))
+    return result
+
+
+def _match_selector(selector: dict, workloads: list[tuple[dict, str]]) -> str | None:
+    """Find the workload name that matches a K8s Service selector."""
+    for wl_labels, wl_name in workloads:
+        if all(wl_labels.get(k) == v for k, v in selector.items()):
+            return wl_name
+    return None
 
 
 def _build_alias_map(manifests: dict, services_by_selector: dict) -> dict[str, str]:
@@ -487,39 +497,26 @@ def _build_alias_map(manifests: dict, services_by_selector: dict) -> dict[str, s
     - ExternalName services that alias another service
     """
     alias_map: dict[str, str] = {}
-
-    # Index workload labels → workload name
-    workload_labels_map: list[tuple[dict, str]] = []
-    for kind in ("Deployment", "StatefulSet"):
-        for m in manifests.get(kind, []):
-            wl_name = m.get("metadata", {}).get("name", "")
-            wl_labels = m.get("metadata", {}).get("labels", {})
-            workload_labels_map.append((wl_labels, wl_name))
+    workloads = _index_workloads(manifests)
 
     # ClusterIP services whose name differs from the workload
     for svc_name, svc_info in services_by_selector.items():
         selector = svc_info.get("selector", {})
         if not selector:
             continue
-        for wl_labels, wl_name in workload_labels_map:
-            if all(wl_labels.get(k) == v for k, v in selector.items()):
-                if svc_name != wl_name:
-                    alias_map[svc_name] = wl_name
-                break
+        wl_name = _match_selector(selector, workloads)
+        if wl_name and svc_name != wl_name:
+            alias_map[svc_name] = wl_name
 
     # ExternalName services: resolve target → compose service name
+    known_workloads = {wl_name for _, wl_name in workloads}
     for svc_manifest in manifests.get("Service", []):
         spec = svc_manifest.get("spec", {})
         if spec.get("type") != "ExternalName":
             continue
         svc_name = svc_manifest.get("metadata", {}).get("name", "")
-        external = spec.get("externalName", "")
-        # Strip .svc.cluster.local to get the K8s service name
-        target = _K8S_DNS_RE.sub(r'\1', external)
-        # Resolve through alias_map or services_by_selector
+        target = _K8S_DNS_RE.sub(r'\1', spec.get("externalName", ""))
         compose_name = alias_map.get(target, target)
-        # Only if it resolves to a known compose service (workload)
-        known_workloads = {wl_name for _, wl_name in workload_labels_map}
         if compose_name in known_workloads:
             alias_map[svc_name] = compose_name
 
@@ -550,9 +547,27 @@ def _generate_configmap_files(cm_name: str, cm_data: dict, output_dir: str,
             if replacements:
                 rewritten = _apply_replacements(rewritten, replacements)
             file_path = os.path.join(abs_dir, key)
-            with open(file_path, "w") as f:
+            with open(file_path, "w", encoding="utf-8") as f:
                 f.write(rewritten)
     return f"./{rel_dir}"
+
+
+def _resolve_secret_keys(secret: dict, items: list | None) -> list[tuple[str, str]]:
+    """Return (key, output_filename) pairs for a Secret volume mount."""
+    if items:
+        keys = [item["key"] for item in items if "key" in item]
+    else:
+        keys = list(secret.get("data", {}).keys()) + list(secret.get("stringData", {}).keys())
+    result = []
+    for key in keys:
+        out_name = key
+        if items:
+            for item in items:
+                if item.get("key") == key and "path" in item:
+                    out_name = item["path"]
+                    break
+        result.append((key, out_name))
+    return result
 
 
 def _generate_secret_files(sec_name: str, secret: dict, items: list | None,
@@ -565,41 +580,20 @@ def _generate_secret_files(sec_name: str, secret: dict, items: list | None,
     if sec_name not in generated_secrets:
         generated_secrets.add(sec_name)
         os.makedirs(abs_dir, exist_ok=True)
-        # Determine which keys to write
-        if items:
-            keys = [item["key"] for item in items if "key" in item]
-        else:
-            keys = list(secret.get("data", {}).keys()) + list(secret.get("stringData", {}).keys())
-        for key in keys:
+        for key, out_name in _resolve_secret_keys(secret, items):
             val = _secret_value(secret, key)
             if val is None:
                 warnings.append(f"Secret '{sec_name}' key '{key}' could not be decoded — skipped")
                 continue
             if replacements:
                 val = _apply_replacements(val, replacements)
-            # Determine output filename (items can remap key → path)
-            out_name = key
-            if items:
-                for item in items:
-                    if item.get("key") == key and "path" in item:
-                        out_name = item["path"]
-                        break
-            file_path = os.path.join(abs_dir, out_name)
-            with open(file_path, "w") as f:
+            with open(os.path.join(abs_dir, out_name), "w", encoding="utf-8") as f:
                 f.write(val)
     return f"./{rel_dir}"
 
 
-def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: set,
-                           config: dict, workload_name: str, warnings: list[str],
-                           configmaps: dict | None = None, secrets: dict | None = None,
-                           output_dir: str = ".", generated_cms: set | None = None,
-                           generated_secrets: set | None = None,
-                           replacements: list[dict] | None = None,
-                           alias_map: dict[str, str] | None = None,
-                           service_port_map: dict | None = None) -> list[str]:
-    """Convert volumeMounts to docker-compose volume strings."""
-    # Build a map of volume name → volume source
+def _build_vol_map(pod_volumes: list) -> dict:
+    """Build a map of volume name → volume source from pod spec volumes."""
     vol_map = {}
     for v in pod_volumes:
         vname = v.get("name", "")
@@ -615,62 +609,71 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
             vol_map[vname] = {"type": "emptydir"}
         else:
             vol_map[vname] = {"type": "unknown"}
+    return vol_map
 
+
+def _convert_pvc_mount(claim: str, mount_path: str, pvc_names: set,
+                       config: dict, warnings: list[str]) -> str:
+    """Convert a PVC volume mount to a compose volume string."""
+    pvc_names.add(claim)
+    vol_cfg = config.get("volumes", {}).get(claim)
+    if vol_cfg and isinstance(vol_cfg, dict) and "host_path" in vol_cfg:
+        resolved = _resolve_host_path(vol_cfg["host_path"], config.get("volume_root", "./data"))
+        return f"{resolved}:{mount_path}"
+    if vol_cfg is not None:
+        return f"{claim}:{mount_path}"
+    warnings.append(f"PVC '{claim}' has no mapping in helmfile2compose.yaml — add it manually")
+    return f"{claim}:{mount_path}"
+
+
+def _convert_data_mount(data_dir: str, vm: dict) -> str:
+    """Build a bind-mount string for a configmap/secret directory, with optional subPath."""
+    mount_path = vm.get("mountPath", "")
+    sub_path = vm.get("subPath")
+    if sub_path:
+        return f"{data_dir}/{sub_path}:{mount_path}:ro"
+    return f"{data_dir}:{mount_path}:ro"
+
+
+def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: set,
+                           config: dict, workload_name: str, warnings: list[str],
+                           configmaps: dict | None = None, secrets: dict | None = None,
+                           output_dir: str = ".", generated_cms: set | None = None,
+                           generated_secrets: set | None = None,
+                           replacements: list[dict] | None = None,
+                           alias_map: dict[str, str] | None = None,
+                           service_port_map: dict | None = None) -> list[str]:
+    """Convert volumeMounts to docker-compose volume strings."""
+    vol_map = _build_vol_map(pod_volumes)
     result = []
     for vm in volume_mounts:
-        vname = vm.get("name", "")
+        source = vol_map.get(vm.get("name", ""), {})
         mount_path = vm.get("mountPath", "")
-        source = vol_map.get(vname, {})
+        vol_type = source.get("type")
 
-        if source.get("type") == "pvc":
-            claim = source["claim"]
-            pvc_names.add(claim)
-            vol_cfg = config.get("volumes", {}).get(claim)
-            if vol_cfg and isinstance(vol_cfg, dict) and "host_path" in vol_cfg:
-                resolved = _resolve_host_path(vol_cfg["host_path"],
-                                              config.get("volume_root", "./data"))
-                result.append(f"{resolved}:{mount_path}")
-            elif vol_cfg is not None:
-                # Named volume
-                result.append(f"{claim}:{mount_path}")
-            else:
-                warnings.append(
-                    f"PVC '{claim}' has no mapping in helmfile2compose.yaml — add it manually"
-                )
-                result.append(f"{claim}:{mount_path}")
-        elif source.get("type") == "emptydir":
-            # Use a tmpfs or anonymous volume
+        if vol_type == "pvc":
+            result.append(_convert_pvc_mount(source["claim"], mount_path, pvc_names, config, warnings))
+        elif vol_type == "emptydir":
             result.append(mount_path)
-        elif source.get("type") == "configmap" and configmaps is not None:
-            cm_name = source["name"]
-            cm = configmaps.get(cm_name)
+        elif vol_type == "configmap" and configmaps is not None:
+            cm = configmaps.get(source["name"])
             if cm is None:
-                warnings.append(f"ConfigMap '{cm_name}' referenced by {workload_name} not found")
+                warnings.append(f"ConfigMap '{source['name']}' referenced by {workload_name} not found")
                 continue
-            cm_dir = _generate_configmap_files(cm_name, cm.get("data", {}),
+            cm_dir = _generate_configmap_files(source["name"], cm.get("data", {}),
                                                output_dir, generated_cms, warnings,
-                                               replacements=replacements,
-                                               alias_map=alias_map,
+                                               replacements=replacements, alias_map=alias_map,
                                                service_port_map=service_port_map)
-            sub_path = vm.get("subPath")
-            if sub_path:
-                result.append(f"{cm_dir}/{sub_path}:{mount_path}:ro")
-            else:
-                result.append(f"{cm_dir}:{mount_path}:ro")
-        elif source.get("type") == "secret" and secrets is not None:
-            sec_name = source["name"]
-            sec = secrets.get(sec_name)
+            result.append(_convert_data_mount(cm_dir, vm))
+        elif vol_type == "secret" and secrets is not None:
+            sec = secrets.get(source["name"])
             if sec is None:
-                warnings.append(f"Secret '{sec_name}' referenced by {workload_name} not found")
+                warnings.append(f"Secret '{source['name']}' referenced by {workload_name} not found")
                 continue
-            sec_dir = _generate_secret_files(sec_name, sec, source.get("items"),
+            sec_dir = _generate_secret_files(source["name"], sec, source.get("items"),
                                              output_dir, generated_secrets, warnings,
                                              replacements=replacements)
-            sub_path = vm.get("subPath")
-            if sub_path:
-                result.append(f"{sec_dir}/{sub_path}:{mount_path}:ro")
-            else:
-                result.append(f"{sec_dir}:{mount_path}:ro")
+            result.append(_convert_data_mount(sec_dir, vm))
 
     return result
 
@@ -682,32 +685,27 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
     to containers.  This resolves the chain: service port → targetPort → containerPort.
     """
     # Index workload labels → container ports
-    workloads: list[tuple[dict, list]] = []
+    workload_ports: dict[str, list] = {}
     for kind in ("Deployment", "StatefulSet"):
         for m in manifests.get(kind, []):
-            labels = m.get("metadata", {}).get("labels", {})
+            name = m.get("metadata", {}).get("name", "")
             containers = m.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-            c_ports = containers[0].get("ports", []) if containers else []
-            workloads.append((labels, c_ports))
+            workload_ports[name] = containers[0].get("ports", []) if containers else []
 
+    workloads = _index_workloads(manifests)
     port_map: dict = {}
     for svc_name, svc_info in services_by_selector.items():
         selector = svc_info.get("selector", {})
         if not selector:
             continue
-        # Find matching workload's container ports
-        matched_ports: list = []
-        for wl_labels, c_ports in workloads:
-            if all(wl_labels.get(k) == v for k, v in selector.items()):
-                matched_ports = c_ports
-                break
+        wl_name = _match_selector(selector, workloads)
+        matched_ports = workload_ports.get(wl_name, []) if wl_name else []
 
         for sp in svc_info.get("ports", []):
             svc_port_num = sp.get("port")
             target = sp.get("targetPort", svc_port_num)
             if isinstance(target, str):
                 target = _resolve_named_port(target, matched_ports)
-            # Allow lookup by port number or port name
             port_map[(svc_name, svc_port_num)] = target
             if sp.get("name"):
                 port_map[(svc_name, sp["name"])] = target
@@ -735,7 +733,7 @@ def _extract_strip_prefix(annotations: dict, path: str) -> str | None:
     return None
 
 
-def convert_ingress(manifest: dict, service_port_map: dict, warnings: list[str],
+def convert_ingress(manifest: dict, service_port_map: dict,
                     alias_map: dict[str, str] | None = None) -> list[dict]:
     """Convert Ingress to Caddyfile entries."""
     entries = []
@@ -797,7 +795,8 @@ def _resolve_volume_root(obj, volume_root: str):
 def _resolve_secret_refs(obj, secrets: dict, warnings: list[str]):
     """Recursively resolve $secret:<name>:<key> placeholders in config values."""
     if isinstance(obj, str):
-        def _replace(m):
+        def _replace(m):  # noqa: E301 — closure for re.sub callback
+            """Resolve a single $secret:<name>:<key> match."""
             sec_name, sec_key = m.group(1), m.group(2)
             sec = secrets.get(sec_name)
             if sec is None:
@@ -820,110 +819,29 @@ def _resolve_secret_refs(obj, secrets: dict, warnings: list[str]):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def convert(manifests: dict[str, list[dict]], config: dict,
-            output_dir: str = ".") -> tuple[dict, list[dict], list[str]]:
-    """Main conversion: returns (compose_services, caddy_entries, warnings)."""
-    warnings: list[str] = []
-    compose_services: dict = {}
-    caddy_entries: list[dict] = []
-    pvc_names: set[str] = set()
-    generated_cms: set[str] = set()
-    generated_secrets: set[str] = set()
-
-    # Index ConfigMaps and Secrets by name
+def _index_manifests(manifests: dict) -> tuple[dict, dict, dict]:
+    """Index ConfigMaps, Secrets, and Services by name for quick lookup."""
     configmaps = {m["metadata"]["name"]: m for m in manifests.get("ConfigMap", [])
                   if "metadata" in m and "name" in m.get("metadata", {})}
     secrets = {m["metadata"]["name"]: m for m in manifests.get("Secret", [])
                if "metadata" in m and "name" in m.get("metadata", {})}
-
-    # Index Services by selector for port/alias resolution
     services_by_selector: dict[str, dict] = {}
     for svc_manifest in manifests.get("Service", []):
         svc_meta = svc_manifest.get("metadata", {})
         svc_spec = svc_manifest.get("spec", {})
-        selector = svc_spec.get("selector", {})
         svc_name = svc_meta.get("name", "")
-        # Use service name as key (unique enough for our purposes)
         services_by_selector[svc_name] = {
             "name": svc_name,
-            "selector": selector,
+            "selector": svc_spec.get("selector", {}),
             "type": svc_spec.get("type", "ClusterIP"),
             "ports": svc_spec.get("ports", []),
         }
+    return configmaps, secrets, services_by_selector
 
-    # User-defined string replacements (applied to env vars and generated files)
-    replacements = config.get("replacements", [])
 
-    # Build alias map: K8s Service names → compose service names
-    alias_map = _build_alias_map(manifests, services_by_selector)
-
-    # Build port map: (K8s Service, port) → container port
-    service_port_map = _build_service_port_map(manifests, services_by_selector)
-
-    # Convert workloads
-    for kind in ("Deployment", "StatefulSet"):
-        for m in manifests.get(kind, []):
-            result = convert_workload(m, configmaps, secrets, services_by_selector,
-                                      pvc_names, config, warnings,
-                                      output_dir=output_dir,
-                                      generated_cms=generated_cms,
-                                      generated_secrets=generated_secrets,
-                                      replacements=replacements,
-                                      alias_map=alias_map,
-                                      service_port_map=service_port_map)
-            if result:
-                compose_services.update(result)
-
-    # Convert Jobs (one-shot tasks: restart on-failure)
-    for m in manifests.get("Job", []):
-        result = convert_workload(m, configmaps, secrets, services_by_selector,
-                                  pvc_names, config, warnings,
-                                  output_dir=output_dir,
-                                  generated_cms=generated_cms,
-                                  generated_secrets=generated_secrets,
-                                  replacements=replacements,
-                                  alias_map=alias_map,
-                                  service_port_map=service_port_map,
-                                  restart_policy="on-failure")
-        if result:
-            compose_services.update(result)
-
-    # Convert Ingresses (resolve Service ports → container ports)
-    for m in manifests.get("Ingress", []):
-        caddy_entries.extend(convert_ingress(m, service_port_map, warnings,
-                                             alias_map=alias_map))
-
-    # Add Caddy reverse proxy service if there are Ingress entries
-    if caddy_entries:
-        compose_services["caddy"] = {
-            "image": "caddy:2-alpine",
-            "restart": "always",
-            "ports": ["80:80", "443:443"],
-            "volumes": [
-                "./Caddyfile:/etc/caddy/Caddyfile:ro",
-                "caddy-data:/data",
-                "caddy-config:/config",
-            ],
-        }
-
-    # Update config with discovered PVCs (default to host_path under volume_root)
-    for pvc in sorted(pvc_names):
-        if pvc not in config["volumes"]:
-            config["volumes"][pvc] = {"host_path": pvc}
-
-    # Emit warnings for unsupported kinds
-    for kind in UNSUPPORTED_KINDS:
-        for m in manifests.get(kind, []):
-            meta = m.get("metadata", {})
-            warnings.append(f"{kind} '{meta.get('name', '?')}' not supported")
-
-    # Warn about truly unknown kinds
-    known = set(CONVERTED_KINDS) | set(UNSUPPORTED_KINDS) | set(IGNORED_KINDS)
-    for kind, items in manifests.items():
-        if kind not in known:
-            warnings.append(f"unknown kind '{kind}' ({len(items)} manifest(s)) — skipped")
-
-    # Apply service overrides from config (resolve $secret: and $volume_root refs)
+def _apply_overrides(compose_services: dict, config: dict,
+                     secrets: dict, warnings: list[str]) -> None:
+    """Apply service overrides and custom services from config."""
     volume_root = config.get("volume_root", "./data")
     for svc_name, overrides in config.get("overrides", {}).items():
         if svc_name not in compose_services:
@@ -935,13 +853,77 @@ def convert(manifests: dict[str, list[dict]], config: dict,
             else:
                 resolved = _resolve_secret_refs(val, secrets, warnings)
                 compose_services[svc_name][key] = _resolve_volume_root(resolved, volume_root)
-
-    # Add custom services from config (resolve $secret: and $volume_root refs)
     for svc_name, svc_def in config.get("services", {}).items():
         if svc_name in compose_services:
             warnings.append(f"custom service '{svc_name}' conflicts with generated service — overwritten")
         resolved = _resolve_secret_refs(svc_def, secrets, warnings)
         compose_services[svc_name] = _resolve_volume_root(resolved, volume_root)
+
+
+def _emit_kind_warnings(manifests: dict, warnings: list[str]) -> None:
+    """Emit warnings for unsupported and unknown manifest kinds."""
+    for kind in UNSUPPORTED_KINDS:
+        for m in manifests.get(kind, []):
+            warnings.append(f"{kind} '{m.get('metadata', {}).get('name', '?')}' not supported")
+    known = set(CONVERTED_KINDS) | set(UNSUPPORTED_KINDS) | set(IGNORED_KINDS)
+    for kind, items in manifests.items():
+        if kind not in known:
+            warnings.append(f"unknown kind '{kind}' ({len(items)} manifest(s)) — skipped")
+
+
+def convert(manifests: dict[str, list[dict]], config: dict,
+            output_dir: str = ".") -> tuple[dict, list[dict], list[str]]:
+    """Main conversion: returns (compose_services, caddy_entries, warnings)."""
+    warnings: list[str] = []
+    compose_services: dict = {}
+    caddy_entries: list[dict] = []
+    pvc_names: set[str] = set()
+    generated_cms: set[str] = set()
+    generated_secrets: set[str] = set()
+
+    configmaps, secrets, services_by_selector = _index_manifests(manifests)
+    replacements = config.get("replacements", [])
+    alias_map = _build_alias_map(manifests, services_by_selector)
+    service_port_map = _build_service_port_map(manifests, services_by_selector)
+
+    # Shared kwargs for convert_workload calls
+    wl_kwargs = {"configmaps": configmaps, "secrets": secrets,
+                  "services_by_selector": services_by_selector,
+                  "pvc_names": pvc_names, "config": config, "warnings": warnings,
+                  "output_dir": output_dir, "generated_cms": generated_cms,
+                  "generated_secrets": generated_secrets, "replacements": replacements,
+                  "alias_map": alias_map, "service_port_map": service_port_map}
+
+    # Convert workloads (Deployments, StatefulSets, Jobs)
+    for kind in ("Deployment", "StatefulSet"):
+        for m in manifests.get(kind, []):
+            result = convert_workload(m, **wl_kwargs)
+            if result:
+                compose_services.update(result)
+    for m in manifests.get("Job", []):
+        result = convert_workload(m, **wl_kwargs, restart_policy="on-failure")
+        if result:
+            compose_services.update(result)
+
+    # Convert Ingresses
+    for m in manifests.get("Ingress", []):
+        caddy_entries.extend(convert_ingress(m, service_port_map,
+                                             alias_map=alias_map))
+    if caddy_entries:
+        compose_services["caddy"] = {
+            "image": "caddy:2-alpine", "restart": "always",
+            "ports": ["80:80", "443:443"],
+            "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro",
+                        "caddy-data:/data", "caddy-config:/config"],
+        }
+
+    # Register discovered PVCs
+    for pvc in sorted(pvc_names):
+        if pvc not in config["volumes"]:
+            config["volumes"][pvc] = {"host_path": pvc}
+
+    _emit_kind_warnings(manifests, warnings)
+    _apply_overrides(compose_services, config, secrets, warnings)
 
     return compose_services, caddy_entries, warnings
 
@@ -970,10 +952,26 @@ def write_compose(services: dict, config: dict, output_dir: str,
         compose["volumes"] = named_volumes
 
     path = os.path.join(output_dir, compose_file)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("# Generated by helmfile2compose — do not edit manually\n")
         yaml.dump(compose, f, default_flow_style=False, sort_keys=False)
     print(f"Wrote {path}", file=sys.stderr)
+
+
+def _write_caddy_host_block(f, host: str, host_entries: list[dict]) -> None:
+    """Write a single Caddy host block (specific paths first, catch-all last)."""
+    specific = [e for e in host_entries if e["path"] and e["path"] != "/"]
+    catchall = [e for e in host_entries if not e["path"] or e["path"] == "/"]
+    f.write(f"{host} {{\n")
+    for entry in specific:
+        f.write(f"\thandle {entry['path']}* {{\n")
+        if entry.get("strip_prefix"):
+            f.write(f"\t\turi strip_prefix {entry['strip_prefix']}\n")
+        f.write(f"\t\treverse_proxy {entry['upstream']}\n")
+        f.write("\t}\n")
+    for entry in catchall:
+        f.write(f"\treverse_proxy {entry['upstream']}\n")
+    f.write("}\n\n")
 
 
 def write_caddyfile(entries: list[dict], output_dir: str,
@@ -983,32 +981,17 @@ def write_caddyfile(entries: list[dict], output_dir: str,
         return
 
     path = os.path.join(output_dir, "Caddyfile")
-    # Group entries by host
     by_host: dict[str, list[dict]] = {}
     for e in entries:
         by_host.setdefault(e["host"], []).append(e)
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("# Generated by helmfile2compose — do not edit manually\n\n")
         caddy_email = (config or {}).get("caddy_email")
         if caddy_email:
-            f.write("{\n")
-            f.write(f"\temail {caddy_email}\n")
-            f.write("}\n\n")
+            f.write(f"{{\n\temail {caddy_email}\n}}\n\n")
         for host, host_entries in by_host.items():
-            # Sort: specific paths first, catch-all "/" last
-            specific = [e for e in host_entries if e["path"] and e["path"] != "/"]
-            catchall = [e for e in host_entries if not e["path"] or e["path"] == "/"]
-            f.write(f"{host} {{\n")
-            for entry in specific:
-                f.write(f"\thandle {entry['path']}* {{\n")
-                if entry.get("strip_prefix"):
-                    f.write(f"\t\turi strip_prefix {entry['strip_prefix']}\n")
-                f.write(f"\t\treverse_proxy {entry['upstream']}\n")
-                f.write("\t}\n")
-            for entry in catchall:
-                f.write(f"\treverse_proxy {entry['upstream']}\n")
-            f.write("}\n\n")
+            _write_caddy_host_block(f, host, host_entries)
     print(f"Wrote {path}", file=sys.stderr)
 
 

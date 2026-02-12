@@ -6,9 +6,11 @@ Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 
 Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
+Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 3 C-rated functions (main, _rewrite_env_values, convert_workload), average B (~6).
+
 ## What exists
 
-Single script `helmfile2compose.py` (~1100 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~1095 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -112,6 +114,9 @@ CronJobs, init containers, sidecars (warning only — takes `containers[0]`), re
 - **Job conversion** — K8s Jobs (migrations, superuser creation, etc.) converted to compose services with `restart: on-failure`. One-shot retry-until-ready pattern. K8s-only Jobs (cert-manager, ingress CRDs) should be excluded.
 - **K8s `$(VAR)` resolution** — Kubelet resolves `$(VAR_NAME)` in container command/args from the container's env vars. Now inlined at generation time.
 - **Shell `$VAR` escaping for compose** — Shell variable references (`$VAR`) in command/entrypoint are escaped to `$$VAR` in compose YAML, preventing compose from interpreting them as host variable substitution. The container's shell expands them at runtime from its own environment.
+
+- **Complexity refactoring** — Major functions refactored to reduce cyclomatic complexity: resolve_env (E→A), convert (D→B), _convert_volume_mounts (D→B), _build_alias_map (C→B), _build_service_port_map (C→B), _generate_secret_files (C→A), convert_workload (C→C), write_caddyfile (C→B). Shared helpers extracted (_index_workloads, _match_selector). Dead code removed (_get_network_aliases). Average complexity: B(8.59) → B(5.98).
+- **Lint cleanup** — Constants grouped at top of file. Unused function parameters removed. Broad `except Exception` narrowed to specific types. All file writes use explicit `encoding="utf-8"`. Pylint 9.56/10, pyflakes clean.
 
 ## Known gaps / next steps
 

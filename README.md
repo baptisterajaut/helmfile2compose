@@ -139,6 +139,14 @@ Stoatchat-specific quirks handled via config:
 
 A larger helmfile (~16 charts) for a collaborative suite (docs, drive, people, keycloak, minio, postgresql, redis). **13 services + 5 init jobs running** via helmfile2compose. Validated automatic alias resolution, port remapping, Job conversion, and K8s variable escaping.
 
+## Code quality
+
+```bash
+pylint helmfile2compose.py          # 9.56/10
+pyflakes helmfile2compose.py        # clean
+radon cc helmfile2compose.py -a -s  # average B (~6), no D/E/F
+```
+
 ## Limitations
 
 Not converted (warning emitted):
