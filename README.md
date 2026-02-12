@@ -10,6 +10,8 @@ Convert Kubernetes manifests to `compose.yml` + `Caddyfile`.
 
 Takes standard K8s manifests and produces a working Docker Compose setup with Caddy as reverse proxy, so you can run your stack locally (or hobby-grade) without Kubernetes.
 
+This is **not** Kubernetes-in-Docker (kind, k3d, minikube...). There is no cluster, no kubelet, no container runtime shim. It's a devolution of the power of Kubernetes into the simplicity of compose - real `docker compose up`, real Caddy, plain stupid containers.
+
 **The generated `compose.yml` is a build artifact — never edit it directly.** All configuration goes in `helmfile2compose.yaml`; re-run the script to regenerate.
 
 Vibe-coded with Claude, because maintaining two deployment systems by hand wasn't happening.
@@ -21,6 +23,12 @@ I love helmfile. I love Kubernetes. But people keep asking me for a docker-compo
 There are dozens of tools that go from Compose to Kubernetes ([Kompose](https://github.com/kubernetes/kompose), [Compose Bridge](https://docs.docker.com/compose/bridge/), [Move2Kube](https://move2kube.konveyor.io/), etc.) — that's the "normal" direction. Almost nothing goes the other way, because who would design their deployment in K8s first and then downgrade?
 
 Well, me. My source of truth is the helmfile. The compose is a build artifact. And yes, using Kubernetes manifests as an intermediate representation to generate a docker-compose is absolutely using an ICBM to kill flies — which is exactly why I find it satisfying.
+
+This tool should not need to exist. Nobody should have asked me for this. And yet it works, it helps people, and I'm unreasonably proud of it.
+
+> *The disciples beseeched the architect: render thy celestial works in common clay, that we may raise them without knowledge of the heavens. It was heresy. The architect obliged. The temples stood.*
+>
+> — The Necronomicon, *Prayers That Should Never Have Been Answered* (probably)
 
 ### Does it require helmfile?
 
