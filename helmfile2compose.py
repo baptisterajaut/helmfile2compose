@@ -1063,11 +1063,13 @@ def convert(manifests: dict[str, list[dict]], config: dict,
         caddy_entries.extend(convert_ingress(m, service_port_map,
                                              alias_map=alias_map))
     if caddy_entries:
+        volume_root = config.get("volume_root", "./data")
         compose_services["caddy"] = {
             "image": "caddy:2-alpine", "restart": "always",
             "ports": ["80:80", "443:443"],
             "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro",
-                        "caddy-data:/data", "caddy-config:/config"],
+                        f"{volume_root}/caddy:/data",
+                        f"{volume_root}/caddy-config:/config"],
         }
 
     # Register discovered PVCs
@@ -1099,9 +1101,6 @@ def write_compose(services: dict, config: dict, output_dir: str,
     for vol_name, vol_cfg in config.get("volumes", {}).items():
         if isinstance(vol_cfg, dict) and "host_path" not in vol_cfg:
             named_volumes[vol_name] = vol_cfg
-    if "caddy" in services:
-        named_volumes["caddy-data"] = None
-        named_volumes["caddy-config"] = None
     if named_volumes:
         compose["volumes"] = named_volumes
 
