@@ -12,9 +12,11 @@ This works in practice (everything eventually converges), but expect noisy logs 
 
 Why not `depends_on`? nerdctl compose ignores it entirely. Docker compose supports `condition: service_completed_successfully`, but relying on it would break nerdctl compatibility. Brute force retry works everywhere.
 
+Exception: sidecar containers use `depends_on` to ensure the main service's container exists before starting (required by `network_mode: container:<name>`). nerdctl compose respects the ordering even though it logs a warning about ignoring the directive.
+
 ## Scaling and replicas
 
-Compose runs one instance of each service. HPA, replica counts (other than 0, which auto-skips the workload), and PodDisruptionBudgets are ignored. This is a single-machine tool.
+Compose runs one instance of each service. HPA, replica counts (other than 0, which auto-skips the workload), and PodDisruptionBudgets are ignored. DaemonSets are converted as regular services (one instance, no node affinity or scheduling). This is a single-machine tool.
 
 ## Resource limits
 
@@ -26,7 +28,9 @@ Liveness, readiness, and startup probes are not converted to compose `healthchec
 
 ## Sidecars
 
-Only the first container (`containers[0]`) is converted. Sidecars (logging agents, proxy containers, etc.) are ignored with a warning.
+Sidecar containers (`containers[1:]`) are converted to separate compose services sharing the main service's network namespace via `network_mode: container:<name>`. Both containers listen on the same hostname, each on its own port — same as a K8s pod.
+
+Limitation: `emptyDir` volumes are not shared between the main container and its sidecars (same limitation as init containers — see [emptyDir volumes](#emptydir-volumes)).
 
 ## CronJobs
 
@@ -60,7 +64,7 @@ If an init container needs to prepare data for the main container via a shared v
 
 ## Pod-level networking
 
-K8s containers in the same pod share `localhost`. In compose, each service has its own network namespace. If two containers communicated via `localhost` in K8s (e.g. a sidecar proxy), they need to use service names instead in compose. Since sidecars are not converted, this is usually not an issue.
+K8s containers in the same pod share `localhost`. Sidecar containers use `network_mode: container:<main>` to share the main service's network namespace, preserving this behavior. Other compose services reach both the main container and its sidecars via the main service name, each on its own port.
 
 ## fieldRef (downward API)
 

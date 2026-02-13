@@ -6,11 +6,11 @@ Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 
 Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
-Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 4 C-rated functions (convert, convert_workload, main, _rewrite_env_values), average C (~15).
+Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 5 C-rated functions (convert, convert_workload, main, _rewrite_env_values, _convert_sidecar_containers), average C (~15).
 
 ## What exists
 
-Single script `helmfile2compose.py` (~1109 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~1320 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -29,7 +29,7 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
 - Parses multi-doc YAML from `helmfile template --output-dir` (recursive `.yaml` scan)
 - Classifies manifests by `kind`
 - Converts:
-  - **Deployment/StatefulSet** → compose `services:` (image, env, command, volumes, ports)
+  - **DaemonSet/Deployment/StatefulSet** → compose `services:` (image, env, command, volumes, ports)
   - **Job** → compose `services:` with `restart: on-failure` (migrations, superuser creation, etc.)
   - **ConfigMap/Secret** → resolved inline into `environment:` + generated as files for volume mounts (`configmaps/`, `secrets/`)
   - **Service (ClusterIP)** → hostname rewriting (K8s Service name → compose service name) in env vars, Caddyfile, configmap files
@@ -37,9 +37,10 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
   - **Service (NodePort/LoadBalancer)** → `ports:` mapping
   - **Ingress** → Caddy service + Caddyfile blocks (`reverse_proxy`), specific paths before catch-all
   - **PVC** → named volumes + `helmfile2compose.yaml` config
-- Warns on stderr for: sidecars, resource limits, HPA, CronJob, PDB, unknown kinds
+- **Sidecar containers** (`containers[1:]`) → separate compose services with `network_mode: container:<main>` (shared network namespace)
+- Warns on stderr for: resource limits, HPA, CronJob, PDB, unknown kinds
 - Silently ignores: RBAC, ServiceAccounts, NetworkPolicies, CRDs, Certificates (Certificate, ClusterIssuer, Issuer), IngressClass, Webhooks, Namespaces
-- Writes `compose.yml` (configurable via `--compose-file`), `Caddyfile`, `helmfile2compose.yaml`
+- Writes `compose.yml` (configurable via `--compose-file`), `Caddyfile` (or `Caddyfile-<project>` when `disableCaddy: true`), `helmfile2compose.yaml`
 
 ### Config file (`helmfile2compose.yaml`)
 
@@ -82,6 +83,8 @@ services:                 # custom services added to compose (not from K8s)
 - `$secret:<name>:<key>` — placeholders in `overrides` and `services` values, resolved from K8s Secret manifests at generation time. `null` values in overrides delete the key.
 - `$volume_root` — placeholder in `overrides` and `services` values, resolved to the `volume_root` config value. Keeps all paths relative to a single configurable root.
 - `caddy_email` — optional. If set, generates a global Caddy block `{ email <value> }` for automatic HTTPS certificate provisioning.
+- `disableCaddy: true` — optional, manual only (never auto-generated). Skips the Caddy service in compose and writes Ingress rules to `Caddyfile-<project>` instead. For cohabiting with existing infrastructure — see `docs/advanced.md`.
+- `network: <name>` — optional. Overrides the default compose network with an external one (`networks.default.external: true`). Required when sharing a network across multiple compose projects.
 
 ### Tested with
 
@@ -92,7 +95,7 @@ services:                 # custom services added to compose (not from K8s)
 
 ## Out of scope (MVP)
 
-CronJobs, sidecars (warning only — takes `containers[0]`), resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPolicies, probes→healthcheck.
+CronJobs, resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPolicies, probes→healthcheck.
 
 ## Recent fixes
 
@@ -124,6 +127,11 @@ CronJobs, sidecars (warning only — takes `containers[0]`), resource limits/req
 - **volumeClaimTemplates** — StatefulSet VCTs now registered as PVC volumes. Previously only `persistentVolumeClaim` references in pod volumes were handled.
 - **PVC pre-registration** — PVCs from both regular volumes and VCTs are pre-registered in config before workload conversion. Fixes first-run where PVCs were discovered too late and rendered as named volumes instead of host_path bind mounts.
 - **Automatic fix-permissions** — Non-root containers (`securityContext.runAsUser > 0`) with PVC bind mounts automatically generate a `fix-permissions` service (busybox, root, `chown -R <uid>`) in compose.yml. No manual config needed. Fixes Bitnami images (PostgreSQL UID 1001, Redis UID 1001, MongoDB UID 1001) failing with `permission denied` on host-mounted data directories.
+
+- **Sidecar container conversion** — K8s sidecar containers (`containers[1:]`) converted to separate compose services with `network_mode: container:<project>-<main>` (shared network namespace). `container_name` set on parent service, `depends_on` ensures startup order. Naming: `{workload}-sidecar-{container-name}`. `_build_service_port_map` now loops all containers (not just `[0]`).
+- **disableCaddy** — `disableCaddy: true` in config skips the Caddy service in compose. Ingress rules still written to `Caddyfile-<project>` for manual merging. Never auto-generated.
+- **External network** — `network: <name>` in config overrides the default compose network with an external one. For cohabiting with existing infrastructure.
+- **DaemonSet conversion** — DaemonSets treated identically to Deployments (single-machine tool, no multi-node scheduling). Added to all workload iteration sites and `CONVERTED_KINDS`.
 
 ## Known gaps / next steps
 

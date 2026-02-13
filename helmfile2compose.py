@@ -44,9 +44,12 @@ IGNORED_KINDS = (
     "NetworkPolicy", "ServiceAccount",
 )
 
+# K8s kinds that produce compose services (iterated together everywhere)
+WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
+
 # Kinds we actively convert (used to detect truly unknown kinds)
 CONVERTED_KINDS = (
-    "Deployment", "StatefulSet", "Job", "ConfigMap", "Secret",
+    *WORKLOAD_KINDS, "ConfigMap", "Secret",
     "Service", "Ingress", "PersistentVolumeClaim",
 )
 
@@ -364,11 +367,6 @@ def resolve_env(container: dict, configmaps: dict[str, dict], secrets: dict[str,
     return env_vars
 
 
-def _emit_sidecar_warnings(pod_spec: dict, full: str, warnings: list[str]) -> None:
-    """Warn about sidecars that aren't converted."""
-    for c in pod_spec.get("containers", [])[1:]:
-        warnings.append(f"sidecar container '{c.get('name', '?')}' on {full} ignored — only main container converted")
-
 
 def _convert_command(container: dict, env_dict: dict[str, str]) -> dict:
     """Convert K8s command/args to compose entrypoint/command with variable resolution."""
@@ -430,6 +428,51 @@ def _convert_init_containers(pod_spec: dict, name: str, config: dict,
     return result
 
 
+def _convert_sidecar_containers(pod_spec: dict, name: str, config: dict,
+                                 pvc_names: set, warnings: list[str],
+                                 restart_policy: str = "always",
+                                 fix_permissions: dict | None = None,
+                                 vcts: list | None = None, **kwargs) -> dict:
+    """Convert sidecar containers to compose services sharing the main service's network."""
+    result = {}
+    for sc in pod_spec.get("containers", [])[1:]:
+        sc_name = sc.get("name", "sidecar")
+        sc_svc_name = f"{name}-sidecar-{sc_name}"
+        sc_full = f"sidecar/{sc_svc_name}"
+        if _is_excluded(sc_svc_name, config.get("exclude", [])):
+            continue
+        project = config.get("name", "")
+        cn = f"{project}-{name}" if project else name
+        sc_svc = {"restart": restart_policy, "network_mode": f"container:{cn}",
+                  "depends_on": [name]}
+        if sc.get("image"):
+            sc_svc["image"] = sc["image"]
+        sc_env_list = resolve_env(sc, kwargs["configmaps"], kwargs["secrets"], sc_full, warnings,
+                                  replacements=kwargs.get("replacements"),
+                                  alias_map=kwargs.get("alias_map"),
+                                  service_port_map=kwargs.get("service_port_map"))
+        sc_env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
+                       for e in sc_env_list}
+        sc_svc.update(_convert_command(sc, sc_env_dict))
+        if sc_env_dict:
+            sc_svc["environment"] = sc_env_dict
+        sc_volumes = _convert_volume_mounts(
+            sc.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+            pvc_names, config, sc_full, warnings, configmaps=kwargs.get("configmaps"),
+            secrets=kwargs.get("secrets"), output_dir=kwargs.get("output_dir", "."),
+            generated_cms=kwargs.get("generated_cms"),
+            generated_secrets=kwargs.get("generated_secrets"),
+            replacements=kwargs.get("replacements"),
+            alias_map=kwargs.get("alias_map"),
+            service_port_map=kwargs.get("service_port_map"),
+            volume_claim_templates=vcts)
+        if sc_volumes:
+            sc_svc["volumes"] = sc_volumes
+        _collect_fix_permissions(pod_spec, sc, fix_permissions, vcts)
+        result[sc_svc_name] = sc_svc
+    return result
+
+
 def _collect_fix_permissions(pod_spec: dict, container: dict,
                              fix_permissions: dict | None,
                              vcts: list | None = None) -> None:
@@ -478,7 +521,6 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
         warnings.append(f"{full} has no containers — skipped")
         return None
 
-    _emit_sidecar_warnings(pod_spec, full, warnings)
     container = containers[0]
 
     result = _convert_init_containers(
@@ -526,6 +568,19 @@ def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[
     _collect_fix_permissions(pod_spec, container, fix_permissions, vcts)
 
     result[name] = svc
+
+    if len(containers) > 1:
+        project = config.get("name", "")
+        cn = f"{project}-{name}" if project else name
+        svc["container_name"] = cn
+        sidecar_result = _convert_sidecar_containers(
+            pod_spec, name, config, pvc_names, warnings, restart_policy=restart_policy,
+            fix_permissions=fix_permissions, vcts=vcts,
+            configmaps=configmaps, secrets=secrets, output_dir=output_dir,
+            generated_cms=generated_cms, generated_secrets=generated_secrets,
+            replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
+        result.update(sidecar_result)
+
     return result
 
 
@@ -563,7 +618,7 @@ def _get_exposed_ports(workload_labels: dict, container_ports: list,
 def _index_workloads(manifests: dict) -> list[tuple[dict, str]]:
     """Index workload labels → workload name for Deployments and StatefulSets."""
     result = []
-    for kind in ("Deployment", "StatefulSet"):
+    for kind in WORKLOAD_KINDS:
         for m in manifests.get(kind, []):
             meta = m.get("metadata", {})
             result.append((meta.get("labels", {}), meta.get("name", "")))
@@ -785,11 +840,14 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
     """
     # Index workload labels → container ports
     workload_ports: dict[str, list] = {}
-    for kind in ("Deployment", "StatefulSet"):
+    for kind in WORKLOAD_KINDS:
         for m in manifests.get(kind, []):
             name = m.get("metadata", {}).get("name", "")
             containers = m.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-            workload_ports[name] = containers[0].get("ports", []) if containers else []
+            all_ports = []
+            for c in containers:
+                all_ports.extend(c.get("ports", []))
+            workload_ports[name] = all_ports
 
     workloads = _index_workloads(manifests)
     port_map: dict = {}
@@ -1020,7 +1078,7 @@ def convert(manifests: dict[str, list[dict]], config: dict,
     fix_permissions: dict[str, int] = {}  # {pvc_claim: uid}
 
     # Pre-register PVCs so _convert_pvc_mount can resolve host_path on first run
-    for kind in ("Deployment", "StatefulSet"):
+    for kind in WORKLOAD_KINDS:
         for m in manifests.get(kind, []):
             spec = m.get("spec", {})
             # StatefulSet volumeClaimTemplates
@@ -1047,22 +1105,19 @@ def convert(manifests: dict[str, list[dict]], config: dict,
                   "alias_map": alias_map, "service_port_map": service_port_map,
                   "fix_permissions": fix_permissions}
 
-    # Convert workloads (Deployments, StatefulSets, Jobs)
-    for kind in ("Deployment", "StatefulSet"):
+    # Convert workloads
+    for kind in WORKLOAD_KINDS:
+        restart = "on-failure" if kind == "Job" else "always"
         for m in manifests.get(kind, []):
-            result = convert_workload(m, **wl_kwargs)
+            result = convert_workload(m, **wl_kwargs, restart_policy=restart)
             if result:
                 compose_services.update(result)
-    for m in manifests.get("Job", []):
-        result = convert_workload(m, **wl_kwargs, restart_policy="on-failure")
-        if result:
-            compose_services.update(result)
 
     # Convert Ingresses
     for m in manifests.get("Ingress", []):
         caddy_entries.extend(convert_ingress(m, service_port_map,
                                              alias_map=alias_map))
-    if caddy_entries:
+    if caddy_entries and not config.get("disableCaddy"):
         volume_root = config.get("volume_root", "./data")
         compose_services["caddy"] = {
             "image": "caddy:2-alpine", "restart": "always",
@@ -1104,9 +1159,19 @@ def write_compose(services: dict, config: dict, output_dir: str,
     if named_volumes:
         compose["volumes"] = named_volumes
 
+    # External network override
+    ext_network = config.get("network")
+    if ext_network:
+        compose["networks"] = {"default": {"external": True, "name": ext_network}}
+
+    has_sidecars = any("container_name" in s for s in services.values())
+
     path = os.path.join(output_dir, compose_file)
     with open(path, "w", encoding="utf-8") as f:
         f.write("# Generated by helmfile2compose — do not edit manually\n")
+        if has_sidecars:
+            f.write("# WARNING: Sidecar containers use container_name for network sharing.\n")
+            f.write("# Do not use 'docker compose -p' — rename via helmfile2compose.yaml instead.\n")
         yaml.dump(compose, f, default_flow_style=False, sort_keys=False)
     print(f"Wrote {path}", file=sys.stderr)
 
@@ -1128,12 +1193,13 @@ def _write_caddy_host_block(f, host: str, host_entries: list[dict]) -> None:
 
 
 def write_caddyfile(entries: list[dict], output_dir: str,
-                    config: dict | None = None) -> None:
+                    config: dict | None = None,
+                    filename: str = "Caddyfile") -> None:
     """Write Caddyfile."""
     if not entries:
         return
 
-    path = os.path.join(output_dir, "Caddyfile")
+    path = os.path.join(output_dir, filename)
     by_host: dict[str, list[dict]] = {}
     for e in entries:
         by_host.setdefault(e["host"], []).append(e)
@@ -1210,7 +1276,7 @@ def main():
 
     # On first run, auto-exclude K8s-only workloads
     if first_run:
-        for kind in ("Deployment", "StatefulSet"):
+        for kind in WORKLOAD_KINDS:
             for m in manifests.get(kind, []):
                 name = m.get("metadata", {}).get("name", "")
                 if any(p in name for p in AUTO_EXCLUDE_PATTERNS):
@@ -1234,7 +1300,11 @@ def main():
         sys.exit(1)
 
     write_compose(services, config, args.output_dir, compose_file=args.compose_file)
-    write_caddyfile(caddy_entries, args.output_dir, config=config)
+    caddy_filename = "Caddyfile"
+    if config.get("disableCaddy"):
+        project = config.get("name", "project")
+        caddy_filename = f"Caddyfile-{project}"
+    write_caddyfile(caddy_entries, args.output_dir, config=config, filename=caddy_filename)
     save_config(config_path, config)
     print(f"Wrote {config_path}", file=sys.stderr)
 

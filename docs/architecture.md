@@ -18,7 +18,7 @@ A dedicated helmfile environment (e.g. `compose`) typically disables K8s-only in
 
 | K8s kind | Compose equivalent |
 |----------|-------------------|
-| Deployment / StatefulSet | `services:` (image, env, command, volumes, ports). Init containers become separate services with `restart: on-failure`. |
+| DaemonSet / Deployment / StatefulSet | `services:` (image, env, command, volumes, ports). Init containers become separate services with `restart: on-failure`. Sidecar containers become separate services with `network_mode: container:<main>` (shared network namespace). DaemonSet treated identically to Deployment (single-machine tool, no multi-node scheduling). |
 | Job | `services:` with `restart: on-failure` (migrations, superuser creation). Init containers converted the same way. |
 | ConfigMap / Secret | Resolved inline into `environment:` + generated as files for volume mounts |
 | Service (ClusterIP) | Hostname rewriting (K8s Service name → compose service name) |
@@ -31,7 +31,6 @@ A dedicated helmfile environment (e.g. `compose`) typically disables K8s-only in
 ### Not converted (warning emitted)
 
 - CronJobs
-- Sidecars (takes `containers[0]` only)
 - Resource limits / requests, HPA, PDB
 
 ### Silently ignored (no compose equivalent)
@@ -95,6 +94,8 @@ services:                   # custom services (not from K8s manifests)
 | `overrides` | Shallow merge into generated services. Set a key to `null` to delete it. Useful for replacing bitnami images with vanilla ones. |
 | `services` | Custom services not from K8s manifests. Combined with `restart: on-failure`, useful for one-shot init tasks. |
 | `caddy_email` | If set, generates a global Caddy block `{ email <value> }` for automatic HTTPS. |
+| `disableCaddy` | If `true`, skips the Caddy service in compose. Ingress rules written to `Caddyfile-<project>` instead. Manual only — never auto-generated. See [advanced.md](advanced.md). |
+| `network` | Override the default compose network with an external one. Required for cohabiting with other compose projects. See [advanced.md](advanced.md). |
 
 ### Placeholders
 

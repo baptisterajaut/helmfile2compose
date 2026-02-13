@@ -4,7 +4,7 @@ This guide covers day-to-day operations once your compose setup is running. For 
 
 ## The golden rule
 
-**Do not edit `compose.yml` or `Caddyfile` by hand.** They are generated from the Helm charts and will be overwritten on the next run of `generate-compose.sh`.
+**Do not edit `compose.yml`, `Caddyfile`, or `Caddyfile-*` by hand.** They are generated from the Helm charts and will be overwritten on the next run of `generate-compose.sh`.
 
 All configuration lives in two files:
 
@@ -29,7 +29,7 @@ After changing helmfile values, chart versions, or helmfile2compose config:
 docker compose up -d
 ```
 
-The script re-renders helmfile templates and regenerates compose. Existing `environments/compose.yaml` and `helmfile2compose.yaml` are preserved — only `compose.yml`, `Caddyfile`, `configmaps/`, and `secrets/` are overwritten.
+The script re-renders helmfile templates and regenerates compose. Existing `environments/compose.yaml` and `helmfile2compose.yaml` are preserved — only `compose.yml`, `Caddyfile` (or `Caddyfile-<project>`), `configmaps/`, and `secrets/` are overwritten.
 
 **Pull regularly.** The compose deployment piggybacks on the same Helm charts used for Kubernetes. When charts are updated (version bumps, config fixes, new features), `git pull && ./generate-compose.sh` picks them up — no manual compose.yml editing.
 
@@ -103,7 +103,7 @@ Delete the generated files and start over:
 
 ```bash
 docker compose down -v
-rm -f compose.yml Caddyfile
+rm -f compose.yml Caddyfile Caddyfile-*
 rm -rf configmaps/ secrets/ generated-platform/
 # Optionally reset environment + config:
 # rm -f environments/compose.yaml helmfile2compose.yaml

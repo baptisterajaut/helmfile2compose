@@ -8,6 +8,9 @@ secrets/
 # Rendered manifests
 .helmfile-rendered/
 
+# Local Claude Code instructions
+CLAUDE.local.md
+
 # Python
 __pycache__/
 *.pyc

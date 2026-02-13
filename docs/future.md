@@ -18,14 +18,15 @@ Problem: the scam stays moldavian. CRD modules depend on the built-in converter 
 
 ### The real move (abstraction)
 
-Refactor ALL kinds into converters behind the same interface. Built-in kinds (Deployment, StatefulSet, DaemonSet, Job, Ingress, Service, ConfigMap, Secret, PVC) and CRDs share the same protocol — no second-class citizens.
+Refactor ALL kinds into converters behind the same interface. Built-in kinds (DaemonSet, Deployment, Job, StatefulSet, Ingress, Service, ConfigMap, Secret, PVC) and CRDs share the same protocol — no second-class citizens.
 
 ```python
 class Converter(Protocol):
     kinds: list[str]
 
     def convert(self, manifests: list[dict], ctx: ConvertContext) -> ConvertResult:
-        """Produces compose services, generated files, or both."""
+        """Produces compose services, generated files, or both.
+        ctx.kind tells which kind triggered the call (e.g. Job vs Deployment)."""
         ...
 ```
 
@@ -41,8 +42,7 @@ CRD converters output compose services directly, not synthetic K8s manifests. No
 
 ### Built-in converters (same file or extracted)
 
-- `WorkloadConverter` — kinds: Deployment, StatefulSet, DaemonSet. All flatten identically to compose services.
-- `JobConverter` — kinds: Job. Compose service with `restart: on-failure`.
+- `WorkloadConverter` — kinds: DaemonSet, Deployment, Job, StatefulSet. All flatten identically to compose services. The converter sets `restart: on-failure` for Jobs, `restart: always` for others (kind available in `ConvertContext`).
 - `IngressConverter` — kinds: Ingress. Caddyfile blocks.
 - `ServiceConverter` — kinds: Service. Hostname rewriting, alias resolution, port remapping.
 - `ConfigSecretConverter` — kinds: ConfigMap, Secret. Inline env resolution + file generation.

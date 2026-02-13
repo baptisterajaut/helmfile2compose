@@ -17,7 +17,7 @@ I love helmfile. I love Kubernetes. But people keep asking me for a docker-compo
 
 I vibe-coded this glorious abomination with Claude rather than MAINTAIN A SEPARATE DOCKER-COMPOSE BY HAND. This script should not need to exist. Nobody should have asked me for this. And yet it works.
 
-It fits in ~1200 lines of pure framework-less Python — which is almost certainly more complex than any compose file it will ever generate, and maybe even me. I could never have written this myself; somewhere around the automatic bind-mount permission fixing, I stopped understanding not just the code it was writing, but its explanations of the code it was writing. As far as I know, nobody has ever made a K8s-to-compose converter powerful enough to be useful to anyone other than an insane cultist — and I'm unreasonably proud of that.
+It fits in ~1300 lines of pure framework-less Python — which is almost certainly more complex than any compose file it will ever generate, and maybe even me. I could never have written this myself; somewhere around the automatic bind-mount permission fixing, I stopped understanding not just the code it was writing, but its explanations of the code it was writing. As far as I know, nobody has ever made a K8s-to-compose converter powerful enough to be useful to anyone other than an insane cultist — and I'm unreasonably proud of that.
 
 > *The disciples beseeched the architect: render thy celestial works in common clay, that we may raise them without knowledge of the heavens. It was heresy. The architect obliged. The temples stood.*
 >
@@ -76,7 +76,7 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 ### Output files
 
 - `compose.yml` -- services (incl. Caddy reverse proxy), volumes
-- `Caddyfile` -- reverse proxy config derived from Ingress manifests
+- `Caddyfile` (or `Caddyfile-<project>` when `disableCaddy: true`) -- reverse proxy config derived from Ingress manifests
 - `helmfile2compose.yaml` -- persistent config ([reference](docs/architecture.md#config-file-helmfile2composeyaml))
 - `configmaps/` -- generated files from ConfigMap volume mounts
 - `secrets/` -- generated files from Secret volume mounts
@@ -86,6 +86,8 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 - **[Architecture](docs/architecture.md)** — pipeline, conversion table, config file reference, K8s vs Compose differences and gotchas
 - **[Usage guide](docs/usage-guide.md)** — day-to-day operations: regenerating, data management, troubleshooting
 - **[Limitations](docs/limitations.md)** — what gets lost in translation (and why)
+- **[Advanced](docs/advanced.md)** — cohabiting with existing infrastructure, multiple projects, disabling Caddy
+- **[Future](docs/future.md)** — CRD converter plugin system, abstraction plans
 
 ## Compatible projects
 
@@ -110,9 +112,9 @@ There is one — a real multi-environment helmfile with operators, SOPS encrypti
 ## Code quality
 
 ```bash
-pylint helmfile2compose.py          # 9.56/10
+pylint helmfile2compose.py          # 9.53/10
 pyflakes helmfile2compose.py        # clean
-radon cc helmfile2compose.py -a -s  # average C (~15), 4 C-rated functions, no D/E/F
+radon cc helmfile2compose.py -a -s  # average C (~15), 5 C-rated functions, no D/E/F
 ```
 
 How the fuck this scores so well is beyond me. Claude probably broke a formula and it overflows somewhere, don't ask me. Good luck maintaining this without an LLM — or when the AI bubble explodes and you have to pay $300/month to talk to one.
