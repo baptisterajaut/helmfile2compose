@@ -93,15 +93,19 @@ These are the projects that caused this tool to exist — helmfile was the sourc
 
 ### [stoatchat-platform](https://github.com/baptisterajaut/stoatchat-platform)
 
-A chat platform (Revolt fork) deployed via helmfile: API, events, file server, proxy, web client, MongoDB, Redis, RabbitMQ, MinIO, LiveKit. **15 services running** via helmfile2compose.
+A chat platform (Revolt rebranded) deployed via helmfile: API, events, file server, proxy, web client, MongoDB, Redis, RabbitMQ, MinIO, LiveKit. **15 services running** via helmfile2compose. The chaos is kept somewhat minimal, as it worked well with the first — rather barebones — release.
 
 Notable config: shared `Revolt.toml` ConfigMap across 8 services, bitnami Redis replaced with vanilla via `overrides:`, MinIO bucket init via custom `services:`, S3 path-style via `replacements:`.
 
-### [suite-helmfile](https://github.com/suitenumerique) (La Suite)
+### [lasuite-platform](https://github.com/baptisterajaut/lasuite-platform)
 
-A collaborative suite (~16 Helm charts): docs, drive, meet, people, conversations, keycloak, minio, postgresql, redis, livekit. **22 services + 11 init jobs running** via helmfile2compose.
+A collaborative suite (~16 Helm charts): docs, drive, meet, people, conversations, keycloak, minio, postgresql, redis, livekit. **22 services + 11 init jobs running** via helmfile2compose. Forbidden knowledge has been acquired. There's tentacles appearing already.
 
 Notable config: wildcard excludes, automatic alias resolution across charts, Job conversion for Django migrations, replicas:0 auto-skip for disabled apps.
+
+### An actual production-critical helmfile?
+
+There is one — a real multi-environment helmfile with operators, SOPS encryption, CI/CD pipelines, and all the ceremonies of proper infrastructure. Converting that would require crossing the barrier of humanity (even for Claude). If you dare gaze into that abyss, see [docs/future.md](docs/future.md).
 
 ## Code quality
 
