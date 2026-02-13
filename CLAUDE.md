@@ -24,6 +24,8 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir .
 
 Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--compose-file`.
 
+**Doc note:** The primary workflow is `--helmfile-dir` (renders + converts in one step). `--from-dir` is for testing or when the caller controls rendering separately (e.g. `generate-compose.sh` in stoat/suite). Documentation should default to `--helmfile-dir` examples, not two-step `helmfile template` + `--from-dir`.
+
 ### What it does
 
 - Parses multi-doc YAML from `helmfile template --output-dir` (recursive `.yaml` scan)

@@ -4,19 +4,12 @@ This guide covers day-to-day operations once your compose setup is running. For 
 
 ## The golden rule
 
-**Do not edit `compose.yml`, `Caddyfile`, or `Caddyfile-*` by hand.** They are generated from the Helm charts and will be overwritten on the next run of `generate-compose.sh`.
+**Do not edit `compose.yml`, `Caddyfile`, or `Caddyfile-*` by hand.** They are generated and will be overwritten on the next run of helmfile2compose.
 
-All configuration lives in two files:
-
-| File | Controls |
-|------|----------|
-| `environments/compose.yaml` | Domain, enabled services, secrets, app-specific config |
-| `helmfile2compose.yaml` | Volume paths, excludes, service overrides, custom services |
-
-Edit those, then re-run:
+All persistent configuration lives in `helmfile2compose.yaml` (volume paths, excludes, service overrides, custom services) and your helmfile environment values. Projects that ship with helmfile2compose (stoatchat-platform, lasuite-platform) use a dedicated `environments/compose.yaml` for helmfile values. Edit those, then re-run:
 
 ```bash
-./generate-compose.sh
+python3 helmfile2compose.py -e compose
 docker compose up -d
 ```
 
@@ -25,13 +18,13 @@ docker compose up -d
 After changing helmfile values, chart versions, or helmfile2compose config:
 
 ```bash
-./generate-compose.sh
+python3 helmfile2compose.py -e compose
 docker compose up -d
 ```
 
-The script re-renders helmfile templates and regenerates compose. Existing `environments/compose.yaml` and `helmfile2compose.yaml` are preserved — only `compose.yml`, `Caddyfile` (or `Caddyfile-<project>`), `configmaps/`, and `secrets/` are overwritten.
+Existing `helmfile2compose.yaml` is preserved — only `compose.yml`, `Caddyfile` (or `Caddyfile-<project>`), `configmaps/`, and `secrets/` are overwritten.
 
-**Pull regularly.** The compose deployment piggybacks on the same Helm charts used for Kubernetes. When charts are updated (version bumps, config fixes, new features), `git pull && ./generate-compose.sh` picks them up — no manual compose.yml editing.
+**Pull regularly.** The compose deployment piggybacks on the same Helm charts used for Kubernetes. When charts are updated (version bumps, config fixes, new features), `git pull` and re-running helmfile2compose picks them up — no manual compose.yml editing.
 
 ## Data management
 
@@ -77,12 +70,12 @@ docker compose logs -f <service>-migrate
 
 ### configmaps/ or secrets/ missing
 
-If you ran `docker compose up` without first running `generate-compose.sh`, the container runtime creates empty directories instead of the expected files. Fix:
+If you ran `docker compose up` without first running helmfile2compose, the container runtime creates empty directories instead of the expected files. Fix:
 
 ```bash
 docker compose down
 rm -rf configmaps/ secrets/
-./generate-compose.sh
+python3 helmfile2compose.py -e compose
 docker compose up -d
 ```
 
@@ -104,9 +97,9 @@ Delete the generated files and start over:
 ```bash
 docker compose down -v
 rm -f compose.yml Caddyfile Caddyfile-*
-rm -rf configmaps/ secrets/ generated-platform/
-# Optionally reset environment + config:
-# rm -f environments/compose.yaml helmfile2compose.yaml
-./generate-compose.sh
+rm -rf configmaps/ secrets/
+# Optionally reset config:
+# rm -f helmfile2compose.yaml
+python3 helmfile2compose.py -e compose
 docker compose up -d
 ```

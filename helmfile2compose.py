@@ -6,6 +6,7 @@ import base64
 import fnmatch
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -72,7 +73,9 @@ def _is_excluded(name: str, exclude_list: list[str]) -> bool:
 def run_helmfile_template(helmfile_dir: str, output_dir: str, environment: str | None = None) -> str:
     """Run helmfile template and return the path to rendered manifests."""
     rendered_dir = os.path.join(output_dir, ".helmfile-rendered")
-    os.makedirs(rendered_dir, exist_ok=True)
+    if os.path.exists(rendered_dir):
+        shutil.rmtree(rendered_dir)
+    os.makedirs(rendered_dir)
     # helmfile auto-detects .gotmpl extension
     helmfile_path = os.path.join(helmfile_dir, "helmfile.yaml")
     if not os.path.exists(helmfile_path):
