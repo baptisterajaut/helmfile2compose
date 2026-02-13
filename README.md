@@ -104,7 +104,9 @@ Notable config: wildcard excludes, automatic alias resolution across charts, Job
 ## Code quality
 
 ```bash
-pylint helmfile2compose.py          # 10.00/10
+pylint helmfile2compose.py          # 9.56/10
 pyflakes helmfile2compose.py        # clean
-radon cc helmfile2compose.py -a -s  # average B (~6), no D/E/F
+radon cc helmfile2compose.py -a -s  # average C (~15), 4 C-rated functions, no D/E/F
 ```
+
+How the fuck this scores so well is beyond me. Claude probably broke a formula and it overflows somewhere, don't ask me. Good luck maintaining this without an LLM — or when the AI bubble explodes and you have to pay $300/month to talk to one.

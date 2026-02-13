@@ -6,7 +6,7 @@ Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 
 Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
-Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 3 C-rated functions (main, _rewrite_env_values, convert_workload), average B (~6).
+Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 4 C-rated functions (convert, convert_workload, main, _rewrite_env_values), average C (~15).
 
 ## What exists
 
