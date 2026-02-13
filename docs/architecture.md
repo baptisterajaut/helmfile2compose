@@ -117,15 +117,18 @@ On first run, K8s-only workloads (matching `cert-manager`, `ingress`, `reflector
 | Namespace isolation | Per-service namespaces | Single compose network |
 | Secret replication | Reflector (cross-namespace) | Not needed (single network) |
 
-## Docker/Compose vs Kubernetes gotchas
+## Docker/Compose gotchas
 
-Some K8s features don't translate to Compose and may require helmfile-side adjustments:
+These are Docker/Compose limitations, not conversion limitations. See [limitations.md](limitations.md) for what gets lost in translation.
 
-- **No `depends_on` enforcement** — nerdctl compose ignores `depends_on` entirely, and even Docker compose `condition: service_completed_successfully` is fragile across runtimes. That's why Jobs (migrations, bucket init) are converted with `restart: on-failure` instead of dependency ordering — they just retry until the dependency is ready. Brute force, but it works everywhere. Init containers will follow the same pattern when supported.
 - **Large port ranges** — K8s with `hostNetwork` handles thousands of ports natively. Docker creates one iptables/pf rule per port, so a range like 50000-60000 (e.g. WebRTC) will kill your network stack. Reduce the range in your compose environment values (e.g. 50000-50100).
 - **hostNetwork** — K8s pods can bind directly to the host network. In Compose, every exposed port must be mapped explicitly.
-- **Pod-to-pod networking** — K8s gives each pod an IP; Compose uses a shared bridge network. This mostly works transparently, but multicast/broadcast or raw IP assumptions won't.
 - **S3 virtual-hosted style** — AWS SDKs default to virtual-hosted bucket URLs (`bucket-name.s3:9000`). Compose DNS can't resolve dotted hostnames. Configure your app to use path-style access and use a `replacement` to flip the setting.
-- **Service port remapping** — Automatic. K8s Service port → container port rewriting happens in env vars, configmap files, and Caddyfile upstreams.
-- **K8s `$(VAR)` in commands** — Kubelet-style variable interpolation in container command/args is resolved at generation time.
-- **Shell `$VAR` escaping** — Shell variable references in command/entrypoint are escaped (`$$`) so compose doesn't substitute them from host env.
+
+### Handled automatically
+
+- **Service port remapping** — K8s Service port → container port rewriting in env vars, configmap files, and Caddyfile upstreams.
+- **K8s `$(VAR)` in commands** — Kubelet-style variable interpolation in container command/args resolved at generation time.
+- **Shell `$VAR` escaping** — Shell variable references in command/entrypoint escaped (`$$`) so compose doesn't substitute them from host env.
+- **K8s DNS rewriting** — `<svc>.<ns>.svc.cluster.local` rewritten to compose service names.
+- **Bind mount permissions** — Non-root containers with PVC bind mounts get an auto-generated `fix-permissions` service.

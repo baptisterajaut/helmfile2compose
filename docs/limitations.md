@@ -36,7 +36,7 @@ Not converted. A CronJob would need an external scheduler or a `sleep`-loop wrap
 
 Operator-managed resources (`Keycloak`, `KeycloakRealmImport`, Zalando `postgresql`, Strimzi `Kafka`, etc.) are skipped with a warning. The tool converts standard K8s kinds only.
 
-CRD support via a converter plugin system is planned - see [FUTURE.md](../FUTURE.md).
+CRD support via a converter plugin system is planned - see [future.md](future.md).
 
 ## Network isolation
 
