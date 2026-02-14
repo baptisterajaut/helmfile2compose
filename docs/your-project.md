@@ -6,7 +6,7 @@ I've been there. Twice. This tool is the scar tissue.
 
 From now on we will call this script **h2c**, because the concept is already mind-numbing enough — reading the full "helmfile2compose" every three words will certainly not help.
 
-> *He who renders the celestial into the mundane does not ascend — he merely ensures that both realms now share his suffering equally.*
+> *He who renders the celestial into the mundane does not ascend — he merely ensures that both realms now share his suffering equally.*  
 >
 > — *Necronomicon, On the Folly of Downward Translation (probably)*
 
@@ -105,6 +105,6 @@ This is by design. Error handling for malformed K8s manifests is not h2c's job �
 
 This tool works. It has been tested on real helmfiles with real users. But it is, fundamentally, an act of desecration — stripping Kubernetes of everything that makes it Kubernetes (scheduling, scaling, self-healing, network policies, RBAC) and leaving behind a flat list of containers. Every edge case you hit is a reminder that you are running something that was designed for orchestration on a machine that has no orchestra — and that the person who asked you for a docker-compose owes you a drink — or the psychiatric bill, whichever comes first.
 
-> *The temple was not translated — it was dismantled, stone by stone, and rebuilt as a shed. The prayers still worked. The architect watched, powerless, as the faithful praised the shed.*
+> *The temple was not translated — it was dismantled, stone by stone, and rebuilt as a shed. The prayers still worked. The architect watched, powerless, as the faithful praised the shed.*  
 >
 > — *De Vermis Mysteriis, On Unnecessary Simplifications (probably, again)*
