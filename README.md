@@ -1,6 +1,6 @@
 # helmfile2compose
 
-*For when you maintain a helmfile but people keep asking for a docker-compose. I'm pretty sure I now have tentacles on my body*
+*For when you maintain a helmfile but people keep asking for a docker-compose. I'm fairly certain I've grown tentacles*
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![License](https://img.shields.io/badge/license-public%20domain-brightgreen)
@@ -86,7 +86,7 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 - **[Usage guide](docs/usage-guide.md)** — day-to-day operations: regenerating, data management, troubleshooting
 - **[Limitations](docs/limitations.md)** — what gets lost in translation (and why)
 - **[Advanced](docs/advanced.md)** — cohabiting with existing infrastructure, multiple projects, disabling Caddy
-- **[Future](docs/future.md)** — CRD converter plugin system, ingress annotation abstraction
+- **[Future](docs/future.md)** — CRD converter plugin system, cert-manager/trust-manager, emulation boundary
 
 ## Compatible projects
 

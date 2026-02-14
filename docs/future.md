@@ -66,7 +66,7 @@ Single file simplicity is a feature, but two real CRD converters now justify the
 
 These two cover both shapes of CRD conversion: "CRD → workload" and "CRD → artifacts consumed by other workloads". The abstraction isn't speculative anymore.
 
-Target: pa-helm-deploy (production helmfile, operators everywhere). Keycloak and cert-manager/trust-manager are the first converters.
+Target: proprietary production helmfile, operators everywhere : Keycloak and cert-manager/trust-manager are the first converters.
 
 ## cert-manager + trust-manager converter
 
@@ -151,7 +151,7 @@ h2c is converging toward a K8s-to-compose emulator — taking declarative K8s re
 
 ### The slope
 
-> *He who flattens the world into files shall find that each file begets another, and each mount begets a service, until the flattening itself becomes a world — and the disciple realizes he has built not a bridge, but a second shore.*
+> *He who flattens the world into files shall find that each file begets another, and each mount begets a service, until the flattening itself becomes a world — and the disciple realizes he has built not a bridge, but a second shore.*  
 > — *Necronomicon, On the Limits of Flattening (probably²)*
 
 The downward API is the canary. It's the first feature that can't be handled at conversion time — it needs a runtime component. If we build it, we're no longer a converter, we're a runtime. That's where h2c stops being a tool and starts being a project that needs its own operator.
@@ -164,5 +164,5 @@ Keycloak + cert-manager/trust-manager are the first two CRD converters. Together
 
 The beautiful absurdity: minikube is a real K8s runtime (kubelet, etcd, apiserver) shoved into a container. h2c does the same job with zero runtime — just array manipulation and file traversal. No controllers, no reconciliation loops, no watch/list, no Go. A Python script that reads YAML and writes YAML. The entire "emulation" happens at conversion time and produces static files. The closest thing to a runtime is `openssl` generating certs.
 
-> *Thus spoke the disciple unto the void: "Yog Sa'rath, my hour has come." And the void answered not — for even it knew that some invocations are answered not with knowledge, but with consequences.*
+> *Thus spoke the disciple unto the void: "Yog Sa'rath, my hour has come." And the void answered not — for even it knew that some invocations are answered not with knowledge, but with consequences.*  
 > — *De Vermis Mysteriis, On the Hubris of the Disciple (don't quote me on this)*
