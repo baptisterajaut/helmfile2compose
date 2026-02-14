@@ -83,11 +83,12 @@ python3 helmfile2compose.py --from-dir /tmp/rendered --output-dir ./compose
 
 ## Documentation
 
+- **[Your project](docs/your-project.md)** — using helmfile2compose with your own helmfile (start here)
 - **[Architecture](docs/architecture.md)** — pipeline, conversion table, config file reference, K8s vs Compose differences and gotchas
 - **[Usage guide](docs/usage-guide.md)** — day-to-day operations: regenerating, data management, troubleshooting
 - **[Limitations](docs/limitations.md)** — what gets lost in translation (and why)
 - **[Advanced](docs/advanced.md)** — cohabiting with existing infrastructure, multiple projects, disabling Caddy
-- **[Future](docs/future.md)** — CRD converter plugin system, abstraction plans
+- **[Future](docs/future.md)** — CRD converter plugin system, ingress annotation abstraction
 
 ## Compatible projects
 

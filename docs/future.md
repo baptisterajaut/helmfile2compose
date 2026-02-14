@@ -60,3 +60,25 @@ Currently each kind's conversion logic is a branch in big functions. Moving to c
 ### Why not now
 
 Single file simplicity is a feature. The refactor is worth doing when there are 2+ real CRD converters to justify it (Keycloak is the first). Init container support is done (generic, didn't require the full abstraction).
+
+## Ingress annotation abstraction
+
+### Problem
+
+Ingress annotation translation is currently hardcoded to `haproxy.org/*` annotations (path rewrite, backend config) with a fallback to `nginx.ingress.kubernetes.io/rewrite-target`. Any other controller's annotations are silently ignored. Both stoatchat-platform and lasuite-platform use HAProxy exclusively, so this covers all current use cases.
+
+### What could be done
+
+An `IngressRewriter` class (or similar) that defines a contract for translating a controller's annotations into Caddy directives. Each controller gets its own implementation:
+
+```python
+class IngressRewriter(Protocol):
+    def get_path_rewrite(self, annotations: dict) -> str | None: ...
+    def get_backend_options(self, annotations: dict) -> dict: ...
+```
+
+Implementations for HAProxy and nginx, dispatched based on `ingressClassName` or annotation prefixes. Adding Traefik/Contour/etc. would be ~20 lines each.
+
+### Why not now
+
+HAProxy is the only controller used by the two platforms this tool was built for. Adding an abstraction for a single implementation is over-engineering. If a third-party fork needs a different controller, the annotation handling is localized enough (~10 lines) to patch directly.
