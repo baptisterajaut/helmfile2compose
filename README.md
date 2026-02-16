@@ -47,7 +47,7 @@ If your stack uses CRDs (Keycloak, cert-manager, trust-manager), grab the operat
 
 Init containers, sidecars, fix-permissions services, and hostname truncation are handled automatically.
 
-CRDs (Keycloak, cert-manager, trust-manager) are handled by [external operators](https://github.com/helmfile2compose/h2c-docs/blob/main/operators.md) via `--extensions-dir`.
+CRDs (Keycloak, cert-manager, trust-manager) are handled by [external operators](https://helmfile2compose.github.io/h2c-docs/operators/) via `--extensions-dir`.
 
 ## Output files
 
