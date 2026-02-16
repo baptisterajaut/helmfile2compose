@@ -11,6 +11,9 @@ secrets/
 # Local Claude Code instructions
 CLAUDE.local.md
 
+# Regression test outputs (contain resolved secrets)
+tests/regression/
+
 # Python
 __pycache__/
 *.pyc

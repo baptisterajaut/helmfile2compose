@@ -82,9 +82,9 @@ Not converted. A CronJob would need an external scheduler or a `sleep`-loop wrap
 
 ### CRDs (Custom Resource Definitions)
 
-Operator-managed resources (`Keycloak`, `KeycloakRealmImport`, Zalando `postgresql`, Strimzi `Kafka`, etc.) are skipped with a warning. The tool converts standard K8s kinds only.
+Operator-managed resources (`Keycloak`, `KeycloakRealmImport`, Zalando `postgresql`, Strimzi `Kafka`, etc.) are skipped with a warning.
 
-CRD support via a converter plugin system is planned - see [future.md](future.md).
+The converter abstraction is in place (dispatch loop, `ConvertContext`/`ConvertResult` dataclasses) — built-in kinds already use it. CRD-specific converters are the next step — see [future.md](future.md).
 
 ### Longhorn
 

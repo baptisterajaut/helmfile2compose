@@ -6,11 +6,11 @@ Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 
 Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
-Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 5 C-rated functions (convert, convert_workload, main, _rewrite_env_values, _convert_sidecar_containers), average C (~15).
+Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 1 C-rated function (WorkloadConverter._build_service), average B (~5.7).
 
 ## What exists
 
-Single script `helmfile2compose.py` (~1320 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~1360 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -122,7 +122,7 @@ CronJobs, resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPoli
 - **Shell `$VAR` escaping for compose** — Shell variable references (`$VAR`) in command/entrypoint are escaped to `$$VAR` in compose YAML, preventing compose from interpreting them as host variable substitution. The container's shell expands them at runtime from its own environment.
 
 - **Complexity refactoring** — Major functions refactored to reduce cyclomatic complexity: resolve_env (E→A), convert (D→B), _convert_volume_mounts (D→B), _build_alias_map (C→B), _build_service_port_map (C→B), _generate_secret_files (C→A), convert_workload (C→C), write_caddyfile (C→B). Shared helpers extracted (_index_workloads, _match_selector). Dead code removed (_get_network_aliases). Average complexity: B(8.59) → B(5.98).
-- **Lint cleanup** — Constants grouped at top of file. Unused function parameters removed. Broad `except Exception` narrowed to specific types. All file writes use explicit `encoding="utf-8"`. Pylint 9.56/10, pyflakes clean.
+- **Lint cleanup** — Constants grouped at top of file. Unused function parameters removed. Broad `except Exception` narrowed to specific types. All file writes use explicit `encoding="utf-8"`. Pylint 9.66/10, pyflakes clean.
 - **Wildcard excludes** — `exclude:` patterns now support wildcards via `fnmatch` (e.g. `meet-celery-*`). Exact names still work.
 - **replicas: 0 auto-skip** — Workloads with `spec.replicas: 0` are automatically skipped with a warning (e.g. disabled AI services in meet). No need to manually exclude them.
 - **Init container conversion** — K8s init containers converted to separate compose services with `restart: on-failure`, named `{workload}-init-{container-name}`. Same brute-force retry pattern as Jobs. Shares pod-level volumes (PVC, ConfigMap, Secret) but not emptyDir (anonymous volumes, not shared between compose services).
@@ -134,6 +134,7 @@ CronJobs, resource limits/requests, HPA, PDB, RBAC, ServiceAccounts, NetworkPoli
 - **disableCaddy** — `disableCaddy: true` in config skips the Caddy service in compose. Ingress rules still written to `Caddyfile-<project>` for manual merging. Never auto-generated.
 - **External network** — `network: <name>` in config overrides the default compose network with an external one. For cohabiting with existing infrastructure.
 - **DaemonSet conversion** — DaemonSets treated identically to Deployments (single-machine tool, no multi-node scheduling). Added to all workload iteration sites and `CONVERTED_KINDS`.
+- **Converter abstraction** — `ConvertContext`/`ConvertResult` dataclasses, `WorkloadConverter`/`IngressConverter` classes, converter dispatch loop in `convert()`, `CONVERTED_KINDS` derived from registrations. `convert_workload` → `WorkloadConverter._convert_one` + `_build_service`, `convert_ingress` → `_convert_one_ingress`. Init/sidecar container bodies deduplicated into `_build_aux_service`. PVC pre-registration extracted to `_preregister_pvcs`, first-run logic to `_init_first_run`, DNS rewrite loop to `_rewrite_k8s_dns_in_env`. Complexity: 5 C-rated → 1 C-rated, average B(5.98) → B(5.7).
 
 ## Known gaps / next steps
 

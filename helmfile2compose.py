@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """helmfile2compose — convert helmfile template output to compose.yml + Caddyfile."""
+# pylint: disable=too-many-locals
 
 import argparse
 import base64
+from dataclasses import dataclass, field
 import fnmatch
 import os
 import re
@@ -12,6 +14,35 @@ import sys
 from pathlib import Path
 
 import yaml
+
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConvertContext:
+    """Shared state passed to all converters during a conversion run."""
+    config: dict
+    output_dir: str
+    configmaps: dict
+    secrets: dict
+    services_by_selector: dict
+    alias_map: dict
+    service_port_map: dict
+    replacements: list
+    pvc_names: set
+    warnings: list
+    generated_cms: set
+    generated_secrets: set
+    fix_permissions: dict
+
+
+@dataclass
+class ConvertResult:
+    """Output of a single converter."""
+    services: dict = field(default_factory=dict)
+    caddy_entries: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +79,11 @@ IGNORED_KINDS = (
 # K8s kinds that produce compose services (iterated together everywhere)
 WORKLOAD_KINDS = ("DaemonSet", "Deployment", "Job", "StatefulSet")
 
-# Kinds we actively convert (used to detect truly unknown kinds)
-CONVERTED_KINDS = (
-    *WORKLOAD_KINDS, "ConfigMap", "Secret",
-    "Service", "Ingress", "PersistentVolumeClaim",
-)
+# Kinds indexed during pre-processing (not dispatched to converters)
+_INDEXED_KINDS = {"ConfigMap", "Secret", "Service", "PersistentVolumeClaim"}
+
+# Converter instances used by convert() — also drives CONVERTED_KINDS
+_CONVERTERS = []  # populated after class definitions (forward reference)
 
 # K8s $(VAR) interpolation in command/args (kubelet resolves these from env vars)
 _K8S_VAR_REF_RE = re.compile(r'\$\(([A-Za-z_][A-Za-z0-9_]*)\)')
@@ -316,12 +347,9 @@ def _resolve_envfrom(envfrom_list: list, configmaps: dict, secrets: dict) -> lis
     return env_vars
 
 
-def _rewrite_env_values(env_vars: list[dict], workload_name: str, warnings: list[str],
-                        replacements: list[dict] | None = None,
-                        alias_map: dict[str, str] | None = None,
-                        service_port_map: dict | None = None) -> None:
-    """Apply DNS rewriting, port remapping, alias resolution, and replacements to env values."""
-    # Rewrite K8s internal DNS
+def _rewrite_k8s_dns_in_env(env_vars: list[dict], workload_name: str,
+                            warnings: list[str]) -> None:
+    """Rewrite K8s internal DNS references in env var values."""
     total_rewrites = 0
     for ev in env_vars:
         if ev["value"] is not None and isinstance(ev["value"], str):
@@ -334,6 +362,14 @@ def _rewrite_env_values(env_vars: list[dict], workload_name: str, warnings: list
             f"{workload_name}: rewrote {total_rewrites} K8s DNS reference(s) "
             f"(*.svc.cluster.local → service name)"
         )
+
+
+def _rewrite_env_values(env_vars: list[dict], workload_name: str, warnings: list[str],
+                        replacements: list[dict] | None = None,
+                        alias_map: dict[str, str] | None = None,
+                        service_port_map: dict | None = None) -> None:
+    """Apply DNS rewriting, port remapping, alias resolution, and replacements to env values."""
+    _rewrite_k8s_dns_in_env(env_vars, workload_name, warnings)
 
     # Apply transforms: port remap → alias resolve → user replacements
     transforms = []
@@ -392,87 +428,67 @@ def _get_run_as_user(pod_spec: dict, container: dict) -> int | None:
     return None
 
 
-def _convert_init_containers(pod_spec: dict, name: str, config: dict,
-                             pvc_names: set, warnings: list[str],
-                             vcts: list | None = None, **kwargs) -> dict:
+def _build_aux_service(container: dict, pod_spec: dict, label: str,
+                       ctx: ConvertContext, base: dict,
+                       vcts: list | None = None) -> dict:
+    """Build a compose service dict for an init or sidecar container."""
+    svc = dict(base)
+    if container.get("image"):
+        svc["image"] = container["image"]
+    env_list = resolve_env(container, ctx.configmaps, ctx.secrets, label, ctx.warnings,
+                           replacements=ctx.replacements, alias_map=ctx.alias_map,
+                           service_port_map=ctx.service_port_map)
+    env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
+                for e in env_list}
+    svc.update(_convert_command(container, env_dict))
+    if env_dict:
+        svc["environment"] = env_dict
+    volumes = _convert_volume_mounts(
+        container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+        ctx.pvc_names, ctx.config, label, ctx.warnings,
+        configmaps=ctx.configmaps, secrets=ctx.secrets,
+        output_dir=ctx.output_dir, generated_cms=ctx.generated_cms,
+        generated_secrets=ctx.generated_secrets, replacements=ctx.replacements,
+        alias_map=ctx.alias_map, service_port_map=ctx.service_port_map,
+        volume_claim_templates=vcts)
+    if volumes:
+        svc["volumes"] = volumes
+    return svc
+
+
+def _convert_init_containers(pod_spec: dict, name: str, ctx: ConvertContext,
+                             vcts: list | None = None) -> dict:
     """Convert init containers to separate compose services with restart: on-failure."""
     result = {}
     for ic in pod_spec.get("initContainers", []):
         ic_name = ic.get("name", "init")
         ic_svc_name = f"{name}-init-{ic_name}"
-        ic_full = f"initContainer/{ic_svc_name}"
-        if _is_excluded(ic_svc_name, config.get("exclude", [])):
+        if _is_excluded(ic_svc_name, ctx.config.get("exclude", [])):
             continue
-        ic_svc = {"restart": "on-failure"}
-        if ic.get("image"):
-            ic_svc["image"] = ic["image"]
-        ic_env_list = resolve_env(ic, kwargs["configmaps"], kwargs["secrets"], ic_full, warnings,
-                                  replacements=kwargs.get("replacements"),
-                                  alias_map=kwargs.get("alias_map"),
-                                  service_port_map=kwargs.get("service_port_map"))
-        ic_env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
-                       for e in ic_env_list}
-        ic_svc.update(_convert_command(ic, ic_env_dict))
-        if ic_env_dict:
-            ic_svc["environment"] = ic_env_dict
-        ic_volumes = _convert_volume_mounts(
-            ic.get("volumeMounts") or [], pod_spec.get("volumes") or [],
-            pvc_names, config, ic_full, warnings, configmaps=kwargs.get("configmaps"),
-            secrets=kwargs.get("secrets"), output_dir=kwargs.get("output_dir", "."),
-            generated_cms=kwargs.get("generated_cms"),
-            generated_secrets=kwargs.get("generated_secrets"),
-            replacements=kwargs.get("replacements"),
-            alias_map=kwargs.get("alias_map"),
-            service_port_map=kwargs.get("service_port_map"),
-            volume_claim_templates=vcts)
-        if ic_volumes:
-            ic_svc["volumes"] = ic_volumes
-        result[ic_svc_name] = ic_svc
+        svc = _build_aux_service(ic, pod_spec, f"initContainer/{ic_svc_name}",
+                                 ctx, {"restart": "on-failure"}, vcts)
+        result[ic_svc_name] = svc
     return result
 
 
-def _convert_sidecar_containers(pod_spec: dict, name: str, config: dict,
-                                 pvc_names: set, warnings: list[str],
+def _convert_sidecar_containers(pod_spec: dict, name: str, ctx: ConvertContext,
                                  restart_policy: str = "always",
-                                 fix_permissions: dict | None = None,
-                                 vcts: list | None = None, **kwargs) -> dict:
+                                 vcts: list | None = None) -> dict:
     """Convert sidecar containers to compose services sharing the main service's network."""
     result = {}
+    project = ctx.config.get("name", "")
+    cn = f"{project}-{name}" if project else name
     for sc in pod_spec.get("containers", [])[1:]:
         sc_name = sc.get("name", "sidecar")
         sc_svc_name = f"{name}-sidecar-{sc_name}"
-        sc_full = f"sidecar/{sc_svc_name}"
-        if _is_excluded(sc_svc_name, config.get("exclude", [])):
+        if _is_excluded(sc_svc_name, ctx.config.get("exclude", [])):
             continue
-        project = config.get("name", "")
-        cn = f"{project}-{name}" if project else name
-        sc_svc = {"restart": restart_policy, "network_mode": f"container:{cn}",
-                  "depends_on": [name]}
-        if sc.get("image"):
-            sc_svc["image"] = sc["image"]
-        sc_env_list = resolve_env(sc, kwargs["configmaps"], kwargs["secrets"], sc_full, warnings,
-                                  replacements=kwargs.get("replacements"),
-                                  alias_map=kwargs.get("alias_map"),
-                                  service_port_map=kwargs.get("service_port_map"))
-        sc_env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
-                       for e in sc_env_list}
-        sc_svc.update(_convert_command(sc, sc_env_dict))
-        if sc_env_dict:
-            sc_svc["environment"] = sc_env_dict
-        sc_volumes = _convert_volume_mounts(
-            sc.get("volumeMounts") or [], pod_spec.get("volumes") or [],
-            pvc_names, config, sc_full, warnings, configmaps=kwargs.get("configmaps"),
-            secrets=kwargs.get("secrets"), output_dir=kwargs.get("output_dir", "."),
-            generated_cms=kwargs.get("generated_cms"),
-            generated_secrets=kwargs.get("generated_secrets"),
-            replacements=kwargs.get("replacements"),
-            alias_map=kwargs.get("alias_map"),
-            service_port_map=kwargs.get("service_port_map"),
-            volume_claim_templates=vcts)
-        if sc_volumes:
-            sc_svc["volumes"] = sc_volumes
-        _collect_fix_permissions(pod_spec, sc, fix_permissions, vcts)
-        result[sc_svc_name] = sc_svc
+        base = {"restart": restart_policy, "network_mode": f"container:{cn}",
+                "depends_on": [name]}
+        svc = _build_aux_service(sc, pod_spec, f"sidecar/{sc_svc_name}",
+                                 ctx, base, vcts)
+        _collect_fix_permissions(pod_spec, sc, ctx.fix_permissions, vcts)
+        result[sc_svc_name] = svc
     return result
 
 
@@ -492,99 +508,107 @@ def _collect_fix_permissions(pod_spec: dict, container: dict,
             fix_permissions[source["claim"]] = uid
 
 
-def convert_workload(manifest: dict, configmaps: dict[str, dict], secrets: dict[str, dict],
-                     services_by_selector: dict, pvc_names: set, config: dict,
-                     warnings: list[str], output_dir: str = ".",
-                     generated_cms: set | None = None,
-                     generated_secrets: set | None = None,
-                     replacements: list[dict] | None = None,
-                     alias_map: dict[str, str] | None = None,
-                     service_port_map: dict | None = None,
-                     restart_policy: str = "always",
-                     fix_permissions: dict | None = None) -> dict | None:
-    """Convert a Deployment, StatefulSet, or Job to a docker-compose service definition."""
-    meta = manifest.get("metadata", {})
-    name = meta.get("name", "unknown")
-    full = f"{manifest.get('kind', '?')}/{name}"
+class WorkloadConverter:
+    """Convert DaemonSet, Deployment, Job, StatefulSet manifests to compose services."""
+    kinds = list(WORKLOAD_KINDS)
 
-    if _is_excluded(name, config.get("exclude", [])):
-        return None
+    def convert(self, kind: str, manifests: list[dict], ctx: ConvertContext) -> ConvertResult:
+        """Convert all manifests of the given workload kind."""
+        services = {}
+        restart = "on-failure" if kind == "Job" else "always"
+        for m in manifests:
+            result = self._convert_one(m, ctx, restart_policy=restart)
+            if result:
+                services.update(result)
+        return ConvertResult(services=services)
 
-    # Skip workloads scaled to zero (e.g. disabled AI services)
-    replicas = manifest.get("spec", {}).get("replicas")
-    if replicas is not None and replicas == 0:
-        warnings.append(f"{full} has replicas: 0 — skipped")
-        return None
+    def _convert_one(self, manifest: dict, ctx: ConvertContext,
+                     restart_policy: str = "always") -> dict | None:
+        """Convert a single workload manifest to compose service(s)."""
+        meta = manifest.get("metadata", {})
+        name = meta.get("name", "unknown")
+        full = f"{manifest.get('kind', '?')}/{name}"
 
-    spec = manifest.get("spec", {})
-    pod_spec = spec.get("template", {}).get("spec", {})
-    vcts = spec.get("volumeClaimTemplates")  # StatefulSet only
-    containers = pod_spec.get("containers", [])
-    if not containers:
-        warnings.append(f"{full} has no containers — skipped")
-        return None
+        if _is_excluded(name, ctx.config.get("exclude", [])):
+            return None
 
-    container = containers[0]
+        # Skip workloads scaled to zero (e.g. disabled AI services)
+        replicas = manifest.get("spec", {}).get("replicas")
+        if replicas is not None and replicas == 0:
+            ctx.warnings.append(f"{full} has replicas: 0 — skipped")
+            return None
 
-    result = _convert_init_containers(
-        pod_spec, name, config, pvc_names, warnings, vcts=vcts,
-        configmaps=configmaps, secrets=secrets, output_dir=output_dir,
-        generated_cms=generated_cms, generated_secrets=generated_secrets,
-        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
+        spec = manifest.get("spec", {})
+        pod_spec = spec.get("template", {}).get("spec", {})
+        vcts = spec.get("volumeClaimTemplates")  # StatefulSet only
+        containers = pod_spec.get("containers", [])
+        if not containers:
+            ctx.warnings.append(f"{full} has no containers — skipped")
+            return None
 
-    # --- Main container ---
-    svc = {"restart": restart_policy}
+        result = _convert_init_containers(pod_spec, name, ctx, vcts=vcts)
+        svc = self._build_service(containers[0], pod_spec, meta, full,
+                                  ctx, restart_policy, vcts)
+        result[name] = svc
 
-    if container.get("image"):
-        svc["image"] = container["image"]
+        if len(containers) > 1:
+            project = ctx.config.get("name", "")
+            cn = f"{project}-{name}" if project else name
+            svc["container_name"] = cn
+            sidecar_result = _convert_sidecar_containers(
+                pod_spec, name, ctx, restart_policy=restart_policy, vcts=vcts)
+            result.update(sidecar_result)
 
-    # Environment (resolve before command so $(VAR) refs can be inlined)
-    env_list = resolve_env(container, configmaps, secrets, full, warnings,
-                           replacements=replacements, alias_map=alias_map,
-                           service_port_map=service_port_map)
-    env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else "" for e in env_list}
+        return result
 
-    svc.update(_convert_command(container, env_dict))
-    if env_dict:
-        svc["environment"] = env_dict
+    @staticmethod
+    def _build_service(container: dict, pod_spec: dict, meta: dict, full: str,
+                       ctx: ConvertContext, restart_policy: str,
+                       vcts: list | None) -> dict:
+        """Build a compose service dict from a K8s container spec."""
+        svc = {"restart": restart_policy}
 
-    # Ports
-    exposed_ports = _get_exposed_ports(meta.get("labels", {}),
-                                       container.get("ports", []), services_by_selector)
-    if exposed_ports:
-        svc["ports"] = exposed_ports
+        if container.get("image"):
+            svc["image"] = container["image"]
 
-    # Volumes
-    svc_volumes = _convert_volume_mounts(
-        container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
-        pvc_names, config, full, warnings, configmaps=configmaps, secrets=secrets,
-        output_dir=output_dir, generated_cms=generated_cms, generated_secrets=generated_secrets,
-        replacements=replacements, alias_map=alias_map, service_port_map=service_port_map,
-        volume_claim_templates=vcts)
-    if svc_volumes:
-        svc["volumes"] = svc_volumes
+        # Environment (resolve before command so $(VAR) refs can be inlined)
+        env_list = resolve_env(container, ctx.configmaps, ctx.secrets, full, ctx.warnings,
+                               replacements=ctx.replacements, alias_map=ctx.alias_map,
+                               service_port_map=ctx.service_port_map)
+        env_dict = {e["name"]: str(e["value"]) if e["value"] is not None else ""
+                    for e in env_list}
 
-    resources = container.get("resources", {})
-    if resources.get("limits") or resources.get("requests"):
-        warnings.append(f"resource limits on {full} ignored")
+        svc.update(_convert_command(container, env_dict))
+        if env_dict:
+            svc["environment"] = env_dict
 
-    _collect_fix_permissions(pod_spec, container, fix_permissions, vcts)
+        # Ports
+        exposed_ports = _get_exposed_ports(meta.get("labels", {}),
+                                           container.get("ports", []),
+                                           ctx.services_by_selector)
+        if exposed_ports:
+            svc["ports"] = exposed_ports
 
-    result[name] = svc
+        # Volumes
+        svc_volumes = _convert_volume_mounts(
+            container.get("volumeMounts") or [], pod_spec.get("volumes") or [],
+            ctx.pvc_names, ctx.config, full, ctx.warnings,
+            configmaps=ctx.configmaps, secrets=ctx.secrets,
+            output_dir=ctx.output_dir,
+            generated_cms=ctx.generated_cms, generated_secrets=ctx.generated_secrets,
+            replacements=ctx.replacements, alias_map=ctx.alias_map,
+            service_port_map=ctx.service_port_map,
+            volume_claim_templates=vcts)
+        if svc_volumes:
+            svc["volumes"] = svc_volumes
 
-    if len(containers) > 1:
-        project = config.get("name", "")
-        cn = f"{project}-{name}" if project else name
-        svc["container_name"] = cn
-        sidecar_result = _convert_sidecar_containers(
-            pod_spec, name, config, pvc_names, warnings, restart_policy=restart_policy,
-            fix_permissions=fix_permissions, vcts=vcts,
-            configmaps=configmaps, secrets=secrets, output_dir=output_dir,
-            generated_cms=generated_cms, generated_secrets=generated_secrets,
-            replacements=replacements, alias_map=alias_map, service_port_map=service_port_map)
-        result.update(sidecar_result)
+        resources = container.get("resources", {})
+        if resources.get("limits") or resources.get("requests"):
+            ctx.warnings.append(f"resource limits on {full} ignored")
 
-    return result
+        _collect_fix_permissions(pod_spec, container, ctx.fix_permissions, vcts)
+
+        return svc
 
 
 def _resolve_named_port(name: str, container_ports: list) -> int | str:
@@ -893,9 +917,9 @@ def _extract_strip_prefix(annotations: dict, path: str) -> str | None:
     return None
 
 
-def convert_ingress(manifest: dict, service_port_map: dict,
-                    alias_map: dict[str, str] | None = None) -> list[dict]:
-    """Convert Ingress to Caddyfile entries."""
+def _convert_one_ingress(manifest: dict, service_port_map: dict,
+                         alias_map: dict[str, str] | None = None) -> list[dict]:
+    """Convert a single Ingress manifest to Caddyfile entries."""
     entries = []
     meta = manifest.get("metadata", {})
     annotations = meta.get("annotations", {})
@@ -939,6 +963,34 @@ def convert_ingress(manifest: dict, service_port_map: dict,
                 "strip_prefix": strip_prefix,
             })
     return entries
+
+
+class IngressConverter:
+    """Convert Ingress manifests to Caddy service + Caddyfile entries."""
+    kinds = ["Ingress"]
+
+    def convert(self, _kind: str, manifests: list[dict], ctx: ConvertContext) -> ConvertResult:
+        """Convert all Ingress manifests."""
+        entries = []
+        for m in manifests:
+            entries.extend(_convert_one_ingress(m, ctx.service_port_map,
+                                                alias_map=ctx.alias_map))
+        services = {}
+        if entries and not ctx.config.get("disableCaddy"):
+            volume_root = ctx.config.get("volume_root", "./data")
+            services["caddy"] = {
+                "image": "caddy:2-alpine", "restart": "always",
+                "ports": ["80:80", "443:443"],
+                "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro",
+                            f"{volume_root}/caddy:/data",
+                            f"{volume_root}/caddy-config:/config"],
+            }
+        return ConvertResult(services=services, caddy_entries=entries)
+
+
+# Populate converter registry now that classes are defined
+_CONVERTERS.extend([WorkloadConverter(), IngressConverter()])
+CONVERTED_KINDS = _INDEXED_KINDS | {k for c in _CONVERTERS for k in c.kinds}
 
 
 def _resolve_volume_root(obj, volume_root: str):
@@ -1063,24 +1115,9 @@ def _emit_kind_warnings(manifests: dict, warnings: list[str]) -> None:
             warnings.append(f"unknown kind '{kind}' ({len(items)} manifest(s)) — skipped")
 
 
-def convert(manifests: dict[str, list[dict]], config: dict,
-            output_dir: str = ".") -> tuple[dict, list[dict], list[str]]:
-    """Main conversion: returns (compose_services, caddy_entries, warnings)."""
-    warnings: list[str] = []
-    compose_services: dict = {}
-    caddy_entries: list[dict] = []
+def _preregister_pvcs(manifests: dict, config: dict) -> set[str]:
+    """Pre-register PVCs in config so _convert_pvc_mount can resolve host_path on first run."""
     pvc_names: set[str] = set()
-    generated_cms: set[str] = set()
-    generated_secrets: set[str] = set()
-
-    configmaps, secrets, services_by_selector = _index_manifests(manifests)
-    replacements = config.get("replacements", [])
-    alias_map = _build_alias_map(manifests, services_by_selector)
-    service_port_map = _build_service_port_map(manifests, services_by_selector)
-
-    fix_permissions: dict[str, int] = {}  # {pvc_claim: uid}
-
-    # Pre-register PVCs so _convert_pvc_mount can resolve host_path on first run
     for kind in WORKLOAD_KINDS:
         for m in manifests.get(kind, []):
             spec = m.get("spec", {})
@@ -1098,44 +1135,46 @@ def convert(manifests: dict[str, list[dict]], config: dict,
                 if claim and claim not in config.get("volumes", {}):
                     config.setdefault("volumes", {})[claim] = {"host_path": claim}
                     pvc_names.add(claim)
+    return pvc_names
 
-    # Shared kwargs for convert_workload calls
-    wl_kwargs = {"configmaps": configmaps, "secrets": secrets,
-                  "services_by_selector": services_by_selector,
-                  "pvc_names": pvc_names, "config": config, "warnings": warnings,
-                  "output_dir": output_dir, "generated_cms": generated_cms,
-                  "generated_secrets": generated_secrets, "replacements": replacements,
-                  "alias_map": alias_map, "service_port_map": service_port_map,
-                  "fix_permissions": fix_permissions}
 
-    # Convert workloads
-    for kind in WORKLOAD_KINDS:
-        restart = "on-failure" if kind == "Job" else "always"
-        for m in manifests.get(kind, []):
-            result = convert_workload(m, **wl_kwargs, restart_policy=restart)
-            if result:
-                compose_services.update(result)
+def convert(manifests: dict[str, list[dict]], config: dict,
+            output_dir: str = ".") -> tuple[dict, list[dict], list[str]]:
+    """Main conversion: returns (compose_services, caddy_entries, warnings)."""
+    warnings: list[str] = []
 
-    # Convert Ingresses
-    for m in manifests.get("Ingress", []):
-        caddy_entries.extend(convert_ingress(m, service_port_map,
-                                             alias_map=alias_map))
-    if caddy_entries and not config.get("disableCaddy"):
-        volume_root = config.get("volume_root", "./data")
-        compose_services["caddy"] = {
-            "image": "caddy:2-alpine", "restart": "always",
-            "ports": ["80:80", "443:443"],
-            "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro",
-                        f"{volume_root}/caddy:/data",
-                        f"{volume_root}/caddy-config:/config"],
-        }
+    configmaps, secrets, services_by_selector = _index_manifests(manifests)
+    replacements = config.get("replacements", [])
+    alias_map = _build_alias_map(manifests, services_by_selector)
+    service_port_map = _build_service_port_map(manifests, services_by_selector)
+    pvc_names = _preregister_pvcs(manifests, config)
+
+    # Build context
+    ctx = ConvertContext(
+        config=config, output_dir=output_dir,
+        configmaps=configmaps, secrets=secrets,
+        services_by_selector=services_by_selector,
+        alias_map=alias_map, service_port_map=service_port_map,
+        replacements=replacements, pvc_names=pvc_names,
+        warnings=warnings, generated_cms=set(),
+        generated_secrets=set(), fix_permissions={},
+    )
+
+    # Dispatch to converters
+    compose_services: dict = {}
+    caddy_entries: list[dict] = []
+    for converter in _CONVERTERS:
+        for kind in converter.kinds:
+            result = converter.convert(kind, manifests.get(kind, []), ctx)
+            compose_services.update(result.services)
+            caddy_entries.extend(result.caddy_entries)
 
     # Register discovered PVCs
     for pvc in sorted(pvc_names):
         if pvc not in config["volumes"]:
             config["volumes"][pvc] = {"host_path": pvc}
 
-    _generate_fix_permissions(fix_permissions, config, compose_services)
+    _generate_fix_permissions(ctx.fix_permissions, config, compose_services)
     _emit_kind_warnings(manifests, warnings)
     _apply_overrides(compose_services, config, secrets, warnings)
 
@@ -1227,6 +1266,23 @@ def emit_warnings(warnings: list[str]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _init_first_run(config: dict, manifests: dict, args) -> None:
+    """Set project name and auto-exclude K8s-only workloads on first run."""
+    source_dir = args.helmfile_dir if not args.from_dir else args.from_dir
+    config["name"] = os.path.basename(os.path.realpath(source_dir))
+    for kind in WORKLOAD_KINDS:
+        for m in manifests.get(kind, []):
+            name = m.get("metadata", {}).get("name", "")
+            if any(p in name for p in AUTO_EXCLUDE_PATTERNS):
+                if name not in config["exclude"]:
+                    config["exclude"].append(name)
+    if config["exclude"]:
+        print(
+            f"Auto-excluded K8s-only workloads: {', '.join(config['exclude'])}",
+            file=sys.stderr,
+        )
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1272,24 +1328,8 @@ def main():
     first_run = not os.path.exists(config_path)
     config = load_config(config_path)
 
-    # On first run, set project name from source directory
     if first_run:
-        source_dir = args.helmfile_dir if not args.from_dir else args.from_dir
-        config["name"] = os.path.basename(os.path.realpath(source_dir))
-
-    # On first run, auto-exclude K8s-only workloads
-    if first_run:
-        for kind in WORKLOAD_KINDS:
-            for m in manifests.get(kind, []):
-                name = m.get("metadata", {}).get("name", "")
-                if any(p in name for p in AUTO_EXCLUDE_PATTERNS):
-                    if name not in config["exclude"]:
-                        config["exclude"].append(name)
-        if config["exclude"]:
-            print(
-                f"Auto-excluded K8s-only workloads: {', '.join(config['exclude'])}",
-                file=sys.stderr,
-            )
+        _init_first_run(config, manifests, args)
 
     # Step 4: convert
     services, caddy_entries, warnings = convert(manifests, config, output_dir=args.output_dir)

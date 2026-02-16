@@ -42,9 +42,9 @@ CRD converters translate operator CRDs into synthetic standard K8s manifests (De
 
 Problem: the scam stays moldavian. CRD modules depend on the built-in converter internals. Adding a new CRD means knowing how to forge a Deployment dict that the main code will accept. Fragile, undocumented contract.
 
-### The real move (operation green card)
+### The real move (operation green card) — partially implemented
 
-Refactor ALL kinds into converters behind the same interface. Built-in kinds and CRDs share the same protocol — no second-class citizens.
+The converter abstraction for built-in kinds is now in place. `WorkloadConverter` and `IngressConverter` exist as classes with `kinds` attributes and `convert()` methods, dispatched via a registration loop in `convert()`. `ConvertContext` and `ConvertResult` are dataclasses. `CONVERTED_KINDS` is derived from converter registrations — no separate list to maintain. The interface is duck-typed (no formal `Protocol` yet).
 
 ```python
 class Converter(Protocol):
@@ -66,19 +66,21 @@ compose.yml + Caddyfile
 
 Built-in converters:
 
-- `WorkloadConverter` — kinds: DaemonSet, Deployment, Job, StatefulSet
-- `IngressConverter` — kinds: Ingress
-- `ServiceConverter` — kinds: Service
-- `ConfigSecretConverter` — kinds: ConfigMap, Secret
-- `PVCConverter` — kinds: PersistentVolumeClaim
+- `WorkloadConverter` — kinds: DaemonSet, Deployment, Job, StatefulSet — **implemented**
+- `IngressConverter` — kinds: Ingress — **implemented**
+- `ServiceConverter` — kinds: Service — planned (Services are indexed for alias/port resolution, not dispatched)
+- `ConfigSecretConverter` — kinds: ConfigMap, Secret — planned (indexed for env/volume resolution, not dispatched)
+- `PVCConverter` — kinds: PersistentVolumeClaim — planned (indexed for volume config, not dispatched)
 
-CRD converters (`converters/` in repo, extras via `--extra-converters-dir`):
+The remaining three (Service, ConfigMap/Secret, PVC) are consumed as lookup data by WorkloadConverter rather than producing compose output directly. Wrapping them as converters would formalize the indexing step and unify the dispatch, but there's no functional benefit until CRD converters need to participate in the same indexing.
+
+CRD converters (`converters/` in repo, extras via `--extra-converters-dir`) — still future:
 
 - `keycloak.py` — kinds: Keycloak, KeycloakRealmImport. Produces a compose service + realm JSON files.
 - `certmanager.py` — kinds: Certificate, ClusterIssuer, Issuer, Bundle. Produces *no services*, only generated cert/truststore files and volume mounts injected into existing services.
 - Future: Zalando PostgreSQL, Strimzi Kafka, etc. Anyone writes ~50 lines of Python.
 
-These two first CRD converters validate the `ConvertResult` design — it must support heterogeneous outputs:
+The infrastructure is ready — adding a CRD converter means writing a class with `kinds` and `convert()`, returning a `ConvertResult`. The `ConvertResult` design with `files`/`mounts` fields for cert-manager is still aspirational:
 
 ```python
 # Keycloak: CRD → workload
@@ -89,7 +91,7 @@ ConvertResult(services={}, files={"certs/app-tls/tls.crt": ..., "certs/app-tls/t
               mounts={"app": ["/path/to/certs/app-tls:/etc/ssl/app:ro"]})
 ```
 
-Both shapes covered: "CRD → workload" and "CRD → artifacts". The abstraction isn't speculative anymore.
+Both shapes covered: "CRD → workload" and "CRD → artifacts". The abstraction isn't speculative anymore — the dispatch loop and dataclasses exist, CRD converters just need to plug in.
 
 ### cert-manager deep dive
 
@@ -113,6 +115,24 @@ How it flattens — operators don't exist in h2c, we emulate their *output*. cer
 5. Services that reference these Secrets/ConfigMaps via `volumeMount` pick them up through the existing mount mechanism
 
 No init service, no runtime CA, no `step-ca`. The "controller" is helmfile2compose itself. The crypto happens once at conversion time.
+
+### Caddy TLS trust
+
+cert-manager generates the certs, but Caddy needs to *trust* them. If backend services listen on HTTPS with certs signed by the custom CA, `reverse_proxy https://service:port` fails unless Caddy knows the CA.
+
+**Short-term (no converter abstraction needed):** a dedicated config block in `helmfile2compose.yaml`:
+
+```yaml
+caddy:
+  trusted_ca: ./certs/selfsigned-ca/ca.crt   # mounted into caddy container
+  backend_tls: true                            # reverse_proxy → https:// + tls_trusted_ca_certs
+```
+
+The script mounts the CA file into the caddy service (`/etc/caddy/trust/ca.crt:ro`), rewrites `reverse_proxy` upstreams to `https://`, and appends `tls_trusted_ca_certs /etc/caddy/trust/ca.crt` to each block. Same pattern as `caddy_email` — config-driven, no abstraction.
+
+**Long-term (with converter abstraction):** the cert-manager converter emits Caddy hooks in its `ConvertResult` — extra volumes for the caddy service, TLS directives for reverse_proxy blocks. The manual config stays as a fallback/override. `ConvertResult` grows a `caddy` field (volumes, global options, per-upstream directives) that the pipeline merges into the Caddyfile and caddy service definition.
+
+The manual config comes first because it works without the converter abstraction and covers non-cert-manager setups (e.g. pre-existing certs dropped into a directory). The converter hook is the automation layer on top.
 
 ## Ingress annotation abstraction
 
