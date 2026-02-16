@@ -57,7 +57,7 @@ AUTO_EXCLUDE_PATTERNS = ("cert-manager", "ingress", "reflector")
 _K8S_DNS_RE = re.compile(
     r'([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.'       # service name (captured)
     r'(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.'       # namespace (discarded)
-    r'svc\.cluster\.local'
+    r'svc(?:\.cluster\.local)?'                    # svc[.cluster.local]
 )
 
 # Placeholder for referencing secrets in overrides/custom services: $secret:<name>:<key>
@@ -128,12 +128,16 @@ def parse_manifests(rendered_dir: str) -> dict[str, list[dict]]:
     manifests: dict[str, list[dict]] = {}
     rendered = Path(rendered_dir)
     for yaml_file in sorted(rendered.rglob("*.yaml")):
-        with open(yaml_file) as f:
-            for doc in yaml.safe_load_all(f):
-                if not doc or not isinstance(doc, dict):
-                    continue
-                kind = doc.get("kind", "Unknown")
-                manifests.setdefault(kind, []).append(doc)
+        try:
+            with open(yaml_file) as f:
+                for doc in yaml.safe_load_all(f):
+                    if not doc or not isinstance(doc, dict):
+                        continue
+                    kind = doc.get("kind", "Unknown")
+                    manifests.setdefault(kind, []).append(doc)
+        except yaml.YAMLError as exc:
+            print(f"⚠ Skipping {yaml_file.name}: {exc.__class__.__name__}",
+                  file=sys.stderr)
     return manifests
 
 
@@ -324,6 +328,15 @@ def _resolve_env_entry(entry: dict, configmaps: dict, secrets: dict,
             f"secretKeyRef '{ref.get('name')}/{ref.get('key')}' "
             f"on {workload_name} could not be resolved"
         )
+    elif "fieldRef" in vf:
+        field = vf["fieldRef"].get("fieldPath", "")
+        if field == "status.podIP":
+            # In compose, the service name is the container's DNS address.
+            svc_name = workload_name.split("/", 1)[-1] if "/" in workload_name else workload_name
+            return {"name": name, "value": svc_name}
+        warnings.append(
+            f"env var '{name}' on {workload_name} uses unsupported fieldRef '{field}' — skipped"
+        )
     else:
         warnings.append(
             f"env var '{name}' on {workload_name} uses unsupported valueFrom — skipped"
@@ -363,6 +376,38 @@ def _rewrite_k8s_dns_in_env(env_vars: list[dict], workload_name: str,
             f"{workload_name}: rewrote {total_rewrites} K8s DNS reference(s) "
             f"(*.svc.cluster.local → service name)"
         )
+
+
+def _postprocess_env(services: dict, ctx) -> None:
+    """Apply DNS rewriting, alias/port resolution, and replacements to all services.
+
+    This catches operator-produced services that bypass WorkloadConverter's
+    per-env-var rewriting. Safe to run on already-processed services (idempotent).
+    """
+    for svc_name, svc in services.items():
+        env = svc.get("environment")
+        if not env or not isinstance(env, dict):
+            continue
+        rewrites = 0
+        for key in list(env):
+            val = env[key]
+            if not isinstance(val, str):
+                continue
+            original = val
+            val, count = rewrite_k8s_dns(val)
+            rewrites += count
+            if ctx.service_port_map:
+                val = _apply_port_remap(val, ctx.service_port_map)
+            if ctx.alias_map:
+                val = _apply_alias_map(val, ctx.alias_map)
+            if ctx.replacements:
+                val = _apply_replacements(val, ctx.replacements)
+            if val != original:
+                env[key] = val
+        if rewrites:
+            ctx.warnings.append(
+                f"Service/{svc_name}: rewrote {rewrites} K8s DNS reference(s) "
+                f"(*.svc.cluster.local → service name)")
 
 
 def _rewrite_env_values(env_vars: list[dict], workload_name: str, warnings: list[str],
@@ -954,13 +999,38 @@ def _convert_one_ingress(manifest: dict, service_port_map: dict,
             # Resolve to container port (Service port → targetPort → containerPort)
             container_port = service_port_map.get((svc_name, svc_port), svc_port)
 
-            scheme = "https" if host in tls_hosts else "http"
+            # Upstream scheme: detect backend SSL from ingress annotations
+            backend_ssl = (
+                annotations.get("haproxy.org/server-ssl", "").lower() == "true"
+                or annotations.get(
+                    "nginx.ingress.kubernetes.io/backend-protocol", ""
+                ).upper() == "HTTPS"
+            )
+            scheme = "https" if backend_ssl else "http"
+            # Backend CA: haproxy.org/server-ca → "namespace/secretName"
+            server_ca_ref = annotations.get("haproxy.org/server-ca", "")
+            server_ca_secret = ""
+            if backend_ssl and server_ca_ref:
+                # Extract secret name (ignore namespace prefix)
+                server_ca_secret = server_ca_ref.split("/")[-1]
+            # TLS server name: haproxy.org/server-sni is the K8s FQDN
+            # the backend expects (matches wildcard cert SANs)
+            server_sni = ""
+            if backend_ssl and server_ca_ref:
+                server_sni = annotations.get("haproxy.org/server-sni", "")
+                if not server_sni:
+                    ns = meta.get("namespace", "")
+                    if ns:
+                        server_sni = (f"{compose_name}.{ns}"
+                                      f".svc.cluster.local")
             strip_prefix = _extract_strip_prefix(annotations, path)
             entries.append({
                 "host": host,
                 "path": path,
                 "upstream": f"{compose_name}:{container_port}",
                 "scheme": scheme,
+                "server_ca_secret": server_ca_secret,
+                "server_sni": server_sni,
                 "strip_prefix": strip_prefix,
             })
     return entries
@@ -979,12 +1049,22 @@ class IngressConverter:
         services = {}
         if entries and not ctx.config.get("disableCaddy"):
             volume_root = ctx.config.get("volume_root", "./data")
+            caddy_volumes = [
+                "./Caddyfile:/etc/caddy/Caddyfile:ro",
+                f"{volume_root}/caddy:/data",
+                f"{volume_root}/caddy-config:/config",
+            ]
+            # Mount CA secrets referenced by server-ca annotations
+            ca_secrets = {e["server_ca_secret"] for e in entries
+                          if e.get("server_ca_secret")}
+            for secret_name in sorted(ca_secrets):
+                caddy_volumes.append(
+                    f"./secrets/{secret_name}"
+                    f":/etc/caddy/certs/{secret_name}:ro")
             services["caddy"] = {
                 "image": "caddy:2-alpine", "restart": "always",
                 "ports": ["80:80", "443:443"],
-                "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro",
-                            f"{volume_root}/caddy:/data",
-                            f"{volume_root}/caddy-config:/config"],
+                "volumes": caddy_volumes,
             }
         return ConvertResult(services=services, caddy_entries=entries)
 
@@ -1042,6 +1122,8 @@ def _load_operators(operators_dir):
             if _is_converter_class(obj, mod_name):
                 converters.append(obj())
 
+    # Sort by priority (lower = earlier). Default 100.
+    converters.sort(key=lambda c: getattr(c, 'priority', 100))
     if converters:
         loaded = ", ".join(
             f"{type(c).__name__} ({', '.join(c.kinds)})" for c in converters)
@@ -1107,6 +1189,17 @@ def _index_manifests(manifests: dict) -> tuple[dict, dict, dict]:
     return configmaps, secrets, services_by_selector
 
 
+def _deep_merge(base: dict, overrides: dict) -> None:
+    """Recursively merge overrides into base. None values delete keys."""
+    for key, val in overrides.items():
+        if val is None:
+            base.pop(key, None)
+        elif isinstance(val, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+
+
 def _apply_overrides(compose_services: dict, config: dict,
                      secrets: dict, warnings: list[str]) -> None:
     """Apply service overrides and custom services from config."""
@@ -1115,12 +1208,9 @@ def _apply_overrides(compose_services: dict, config: dict,
         if svc_name not in compose_services:
             warnings.append(f"override for '{svc_name}' but no such generated service — skipped")
             continue
-        for key, val in overrides.items():
-            if val is None:
-                compose_services[svc_name].pop(key, None)
-            else:
-                resolved = _resolve_secret_refs(val, secrets, warnings)
-                compose_services[svc_name][key] = _resolve_volume_root(resolved, volume_root)
+        resolved = _resolve_secret_refs(overrides, secrets, warnings)
+        resolved = _resolve_volume_root(resolved, volume_root)
+        _deep_merge(compose_services[svc_name], resolved)
     for svc_name, svc_def in config.get("services", {}).items():
         if svc_name in compose_services:
             warnings.append(f"custom service '{svc_name}' conflicts with generated service — overwritten")
@@ -1225,6 +1315,10 @@ def convert(manifests: dict[str, list[dict]], config: dict,
             compose_services.update(result.services)
             caddy_entries.extend(result.caddy_entries)
 
+    # Post-process all services: DNS rewriting, alias resolution, replacements.
+    # Idempotent — safe on services already processed by WorkloadConverter.
+    _postprocess_env(compose_services, ctx)
+
     # Register discovered PVCs
     for pvc in sorted(pvc_names):
         if pvc not in config["volumes"]:
@@ -1233,6 +1327,12 @@ def convert(manifests: dict[str, list[dict]], config: dict,
     _generate_fix_permissions(ctx.fix_permissions, config, compose_services)
     _emit_kind_warnings(manifests, warnings)
     _apply_overrides(compose_services, config, secrets, warnings)
+
+    # Linux hostname limit is 63 chars; compose uses the service name as hostname.
+    # Set an explicit shorter hostname to avoid sethostname failures.
+    for svc_name, svc in compose_services.items():
+        if len(svc_name) > 63 and "hostname" not in svc:
+            svc["hostname"] = svc_name[:63]
 
     return compose_services, caddy_entries, warnings
 
@@ -1274,19 +1374,44 @@ def write_compose(services: dict, config: dict, output_dir: str,
     print(f"Wrote {path}", file=sys.stderr)
 
 
-def _write_caddy_host_block(f, host: str, host_entries: list[dict]) -> None:
+def _write_caddy_reverse_proxy(f, entry: dict, indent: str = "\t") -> None:
+    """Write a reverse_proxy directive, with TLS transport if upstream is HTTPS."""
+    scheme = entry.get("scheme", "http")
+    upstream = entry["upstream"]
+    if scheme != "https":
+        f.write(f"{indent}reverse_proxy {upstream}\n")
+        return
+    ca_secret = entry.get("server_ca_secret", "")
+    f.write(f"{indent}reverse_proxy https://{upstream} {{\n")
+    f.write(f"{indent}\ttransport http {{\n")
+    if ca_secret:
+        sni = entry.get("server_sni", "")
+        if sni:
+            f.write(f"{indent}\t\ttls_server_name {sni}\n")
+        f.write(f"{indent}\t\ttls_trust_pool file"
+                f" /etc/caddy/certs/{ca_secret}/ca.crt\n")
+    else:
+        f.write(f"{indent}\t\ttls_insecure_skip_verify\n")
+    f.write(f"{indent}\t}}\n")
+    f.write(f"{indent}}}\n")
+
+
+def _write_caddy_host_block(f, host: str, host_entries: list[dict],
+                            tls_internal: bool = False) -> None:
     """Write a single Caddy host block (specific paths first, catch-all last)."""
     specific = [e for e in host_entries if e["path"] and e["path"] != "/"]
     catchall = [e for e in host_entries if not e["path"] or e["path"] == "/"]
     f.write(f"{host} {{\n")
+    if tls_internal:
+        f.write("\ttls internal\n")
     for entry in specific:
         f.write(f"\thandle {entry['path']}* {{\n")
         if entry.get("strip_prefix"):
             f.write(f"\t\turi strip_prefix {entry['strip_prefix']}\n")
-        f.write(f"\t\treverse_proxy {entry['upstream']}\n")
+        _write_caddy_reverse_proxy(f, entry, indent="\t\t")
         f.write("\t}\n")
     for entry in catchall:
-        f.write(f"\treverse_proxy {entry['upstream']}\n")
+        _write_caddy_reverse_proxy(f, entry)
     f.write("}\n\n")
 
 
@@ -1298,8 +1423,13 @@ def write_caddyfile(entries: list[dict], output_dir: str,
         return
 
     path = os.path.join(output_dir, filename)
+    replacements = (config or {}).get("replacements", [])
     by_host: dict[str, list[dict]] = {}
     for e in entries:
+        # Apply replacements to upstream names (e.g. service alias rewrites)
+        if replacements:
+            for r in replacements:
+                e["upstream"] = e["upstream"].replace(r["old"], r["new"])
         by_host.setdefault(e["host"], []).append(e)
 
     with open(path, "w", encoding="utf-8") as f:
@@ -1307,8 +1437,9 @@ def write_caddyfile(entries: list[dict], output_dir: str,
         caddy_email = (config or {}).get("caddy_email")
         if caddy_email:
             f.write(f"{{\n\temail {caddy_email}\n}}\n\n")
+        tls_internal = bool((config or {}).get("caddy_tls_internal"))
         for host, host_entries in by_host.items():
-            _write_caddy_host_block(f, host, host_entries)
+            _write_caddy_host_block(f, host, host_entries, tls_internal)
     print(f"Wrote {path}", file=sys.stderr)
 
 
@@ -1397,7 +1528,7 @@ def main():
             print(f"Operators directory not found: {args.operators_dir}", file=sys.stderr)
             sys.exit(1)
         extra = _load_operators(args.operators_dir)
-        _CONVERTERS.extend(extra)
+        _CONVERTERS[0:0] = extra
         CONVERTED_KINDS.update(k for c in extra for k in c.kinds)
 
     # Step 4: convert
