@@ -87,6 +87,9 @@ _INDEXED_KINDS = {"ConfigMap", "Secret", "Service", "PersistentVolumeClaim"}
 # Converter instances used by convert() — also drives CONVERTED_KINDS
 _CONVERTERS = []  # populated after class definitions (forward reference)
 
+# Transform instances — post-processing hooks that run after alias injection
+_TRANSFORMS = []
+
 # K8s $(VAR) interpolation in command/args (kubelet resolves these from env vars)
 _K8S_VAR_REF_RE = re.compile(r'\$\(([A-Za-z_][A-Za-z0-9_]*)\)')
 
@@ -1196,9 +1199,18 @@ def _is_converter_class(obj, mod_name):
             and obj.__module__ == mod_name)
 
 
+def _is_transform_class(obj, mod_name):
+    """Check if obj is a transform class defined in the given module."""
+    return (isinstance(obj, type)
+            and hasattr(obj, 'transform') and callable(getattr(obj, 'transform'))
+            and not hasattr(obj, 'kinds')
+            and obj.__module__ == mod_name)
+
+
 def _load_extensions(extensions_dir):
-    """Load converter classes from an extensions directory."""
+    """Load converter and transform classes from an extensions directory."""
     converters = []
+    transforms = []
     for filepath in _discover_extension_files(extensions_dir):
         parent = str(Path(filepath).parent)
         if parent not in sys.path:
@@ -1217,14 +1229,20 @@ def _load_extensions(extensions_dir):
             obj = getattr(module, attr_name)
             if _is_converter_class(obj, mod_name):
                 converters.append(obj())
+            elif _is_transform_class(obj, mod_name):
+                transforms.append(obj())
 
     # Sort by priority (lower = earlier). Default 100.
     converters.sort(key=lambda c: getattr(c, 'priority', 100))
+    transforms.sort(key=lambda t: getattr(t, 'priority', 100))
     if converters:
         loaded = ", ".join(
             f"{type(c).__name__} ({', '.join(c.kinds)})" for c in converters)
         print(f"Loaded extensions: {loaded}", file=sys.stderr)
-    return converters
+    if transforms:
+        loaded = ", ".join(type(t).__name__ for t in transforms)
+        print(f"Loaded transforms: {loaded}", file=sys.stderr)
+    return converters, transforms
 
 
 def _resolve_volume_root(obj, volume_root: str):
@@ -1452,6 +1470,10 @@ def convert(manifests: dict[str, list[dict]], config: dict,
         if len(svc_name) > 63 and "hostname" not in svc:
             svc["hostname"] = svc_name[:63]
 
+    # Run transforms (post-processing hooks) after all alias injection
+    for transform_cls in _TRANSFORMS:
+        transform_cls.transform(compose_services, caddy_entries, ctx)
+
     return compose_services, caddy_entries, warnings
 
 
@@ -1648,10 +1670,11 @@ def main():
         if not os.path.isdir(args.extensions_dir):
             print(f"Extensions directory not found: {args.extensions_dir}", file=sys.stderr)
             sys.exit(1)
-        extra = _load_extensions(args.extensions_dir)
+        extra_converters, extra_transforms = _load_extensions(args.extensions_dir)
+        _TRANSFORMS.extend(extra_transforms)
         # Check for duplicate kind claims between extensions
         ext_kind_owners: dict[str, str] = {}
-        for c in extra:
+        for c in extra_converters:
             for k in c.kinds:
                 if k in ext_kind_owners:
                     print(f"Error: kind '{k}' claimed by both "
@@ -1668,8 +1691,8 @@ def main():
                 c.kinds = [k for k in c.kinds if k not in overridden]
                 print(f"Extension overrides built-in {type(c).__name__} "
                       f"for: {', '.join(sorted(lost))}")
-        _CONVERTERS[0:0] = extra
-        CONVERTED_KINDS.update(k for c in extra for k in c.kinds)
+        _CONVERTERS[0:0] = extra_converters
+        CONVERTED_KINDS.update(k for c in extra_converters for k in c.kinds)
 
     # Step 4: convert
     services, caddy_entries, warnings = convert(manifests, config, output_dir=args.output_dir)

@@ -58,15 +58,21 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
 
 ### External extensions (`--extensions-dir`)
 
-CRD conversion is extensible via external extension modules. `--extensions-dir` points to a directory of `.py` files (or cloned repos with `.py` files one level deep). Each module provides converter classes with `kinds` and `convert()` — same interface as built-in converters. Loaded extensions sorted by `priority` (lower = earlier, default 100), inserted before built-in converters.
+Two extension types, loaded from the same `--extensions-dir`:
 
-Operators import `ConvertContext`/`ConvertResult` from `helmfile2compose`. `apply_replacements(text, replacements)` and `resolve_env(container, configmaps, secrets, workload_name, warnings, replacements=None, service_port_map=None)` are also public — available to operators that need string replacement or env resolution. Available operators:
-- **keycloak** — `Keycloak`, `KeycloakRealmImport` (priority 50)
-- **cert-manager** — `Certificate`, `ClusterIssuer`, `Issuer` (priority 10, requires `cryptography`)
-- **trust-manager** — `Bundle` (priority 20, depends on cert-manager)
-- **servicemonitor** — `Prometheus`, `ServiceMonitor` (priority 60, requires `pyyaml`)
+- **Converters** — classes with `kinds` and `convert()`. Produce compose services from K8s manifests. Sorted by `priority` (lower = earlier, default 100), inserted before built-in converters.
+- **Transforms** — classes with `transform(compose_services, caddy_entries, ctx)` and no `kinds`. Post-process the final compose output after alias injection. Sorted by `priority` (default 100).
 
-Install via h2c-manager: `python3 h2c-manager.py keycloak cert-manager trust-manager servicemonitor`
+`--extensions-dir` points to a directory of `.py` files (or cloned repos with `.py` files one level deep). The loader detects each type automatically.
+
+Operators import `ConvertContext`/`ConvertResult` from `helmfile2compose`. `apply_replacements(text, replacements)` and `resolve_env(container, configmaps, secrets, workload_name, warnings, replacements=None, service_port_map=None)` are also public — available to operators that need string replacement or env resolution. Available extensions:
+- **keycloak** — converter: `Keycloak`, `KeycloakRealmImport` (priority 50)
+- **cert-manager** — converter: `Certificate`, `ClusterIssuer`, `Issuer` (priority 10, requires `cryptography`)
+- **trust-manager** — converter: `Bundle` (priority 20, depends on cert-manager)
+- **servicemonitor** — converter: `Prometheus`, `ServiceMonitor` (priority 60, requires `pyyaml`)
+- **flatten-internal-urls** — transform: strip aliases, rewrite FQDNs (priority 200, incompatible with cert-manager)
+
+Install via h2c-manager: `python3 h2c-manager.py keycloak cert-manager trust-manager servicemonitor flatten-internal-urls`
 
 ### Config file (`helmfile2compose.yaml`)
 
@@ -118,7 +124,7 @@ services:                 # custom services added to compose (not from K8s)
 
 ### Automatic rewrites
 
-- **Network aliases** — each service gets `networks.default.aliases` with K8s FQDN variants (`svc.ns.svc.cluster.local`, `svc.ns.svc`, `svc.ns`). FQDNs resolve natively via compose DNS — no hostname rewriting. Requires Docker Compose (nerdctl does not support network aliases).
+- **Network aliases** — each service gets `networks.default.aliases` with K8s FQDN variants (`svc.ns.svc.cluster.local`, `svc.ns.svc`, `svc.ns`). FQDNs resolve natively via compose DNS — no hostname rewriting. Requires Docker Compose (nerdctl does not support network aliases). The `flatten-internal-urls` transform strips aliases and rewrites FQDNs to short names for nerdctl compatibility.
 - **Service aliases** — K8s Services whose name differs from the workload get a short alias on the compose service
 - **Port remapping** — K8s Service port → container port in URLs and env vars (FQDN variants also matched)
 - **Kubelet `$(VAR)`** — resolved from container env vars at generation time
