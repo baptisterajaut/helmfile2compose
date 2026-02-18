@@ -1161,7 +1161,7 @@ class HAProxyRewriter(IngressRewriter):
         cls = get_ingress_class(manifest, ingress_types)
         if cls in ("haproxy", ""):
             return True
-        annotations = manifest.get("metadata", {}).get("annotations", {})
+        annotations = manifest.get("metadata", {}).get("annotations") or {}
         return any(k.startswith("haproxy.org/") for k in annotations)
 
     def rewrite(self, manifest, ctx):
