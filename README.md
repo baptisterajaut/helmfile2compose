@@ -70,6 +70,9 @@ Full docs at [helmfile2compose.github.io](https://helmfile2compose.github.io).
 | [h2c-converter-cert-manager](https://github.com/helmfile2compose/h2c-converter-cert-manager) | cert-manager CRD converter |
 | [h2c-converter-trust-manager](https://github.com/helmfile2compose/h2c-converter-trust-manager) | trust-manager CRD converter |
 | [h2c-provider-servicemonitor](https://github.com/helmfile2compose/h2c-provider-servicemonitor) | Prometheus & ServiceMonitor CRD provider |
+| [h2c-transform-flatten-internal-urls](https://github.com/helmfile2compose/h2c-transform-flatten-internal-urls) | Strip aliases, rewrite FQDNs to short names |
+| [h2c-rewriter-nginx](https://github.com/helmfile2compose/h2c-rewriter-nginx) | Nginx ingress annotation rewriter |
+| [h2c-rewriter-traefik](https://github.com/helmfile2compose/h2c-rewriter-traefik) | Traefik ingress annotation rewriter (POC) |
 
 ## License
 
