@@ -1016,7 +1016,7 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
             containers = containers.get("containers") or []
             all_ports = []
             for c in containers:
-                all_ports.extend(c.get("ports", []))
+                all_ports.extend(c.get("ports") or [])
             workload_ports[name] = all_ports
 
     workloads = _index_workloads(manifests)
