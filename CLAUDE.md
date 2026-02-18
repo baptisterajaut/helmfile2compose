@@ -46,7 +46,7 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
   - **Service (ClusterIP)** → hostname rewriting (K8s Service name → compose service name) in env vars, Caddyfile, configmap files
   - **Service (ExternalName)** → resolved through alias chain (e.g. `docs-media` → minio FQDN → `minio`)
   - **Service (NodePort/LoadBalancer)** → `ports:` mapping
-  - **Ingress** → Caddy service + Caddyfile blocks (`reverse_proxy`), backend SSL via TLS transport, specific paths before catch-all
+  - **Ingress** → Caddy service + Caddyfile blocks (`reverse_proxy`), dispatched to `IngressRewriter` classes by `ingressClassName`. Backend SSL via TLS transport, specific paths before catch-all. `extra_directives` for raw Caddy directives. Built-in: `HAProxyRewriter`.
   - **PVC** → named volumes + `helmfile2compose.yaml` config
 - **Init containers** → separate compose services with `restart: on-failure`, named `{workload}-init-{container-name}`
 - **Sidecar containers** (`containers[1:]`) → separate compose services with `network_mode: container:<main>` (shared network namespace)
@@ -58,14 +58,15 @@ Flags: `--helmfile-dir`, `-e`/`--environment`, `--from-dir`, `--output-dir`, `--
 
 ### External extensions (`--extensions-dir`)
 
-Two extension types, loaded from the same `--extensions-dir`:
+Three extension types, loaded from the same `--extensions-dir`:
 
 - **Converters** — classes with `kinds` and `convert()`. Produce compose services from K8s manifests. Sorted by `priority` (lower = earlier, default 100), inserted before built-in converters.
 - **Transforms** — classes with `transform(compose_services, caddy_entries, ctx)` and no `kinds`. Post-process the final compose output after alias injection. Sorted by `priority` (default 100).
+- **Ingress rewriters** — classes with `name`, `match()`, and `rewrite()`. Translate controller-specific Ingress annotations to Caddy entries. Same `name` replaces built-in. Sorted by `priority` (default 100).
 
 `--extensions-dir` points to a directory of `.py` files (or cloned repos with `.py` files one level deep). The loader detects each type automatically.
 
-Operators import `ConvertContext`/`ConvertResult` from `helmfile2compose`. `apply_replacements(text, replacements)` and `resolve_env(container, configmaps, secrets, workload_name, warnings, replacements=None, service_port_map=None)` are also public — available to operators that need string replacement or env resolution. Available extensions:
+Operators import `ConvertContext`/`ConvertResult`/`IngressRewriter` from `helmfile2compose`. `get_ingress_class(manifest, ingress_types)` and `resolve_backend(path_entry, manifest, ctx)` are public helpers for rewriters. `apply_replacements(text, replacements)` and `resolve_env(container, configmaps, secrets, workload_name, warnings, replacements=None, service_port_map=None)` are also public — available to operators that need string replacement or env resolution. Available extensions:
 - **keycloak** — converter: `Keycloak`, `KeycloakRealmImport` (priority 50)
 - **cert-manager** — converter: `Certificate`, `ClusterIssuer`, `Issuer` (priority 10, requires `cryptography`)
 - **trust-manager** — converter: `Bundle` (priority 20, depends on cert-manager)
@@ -117,6 +118,7 @@ services:                 # custom services added to compose (not from K8s)
 - `$volume_root` — placeholder in `overrides` and `services` values, resolved to the `volume_root` config value.
 - `caddy_email` — optional. Generates a global Caddy block `{ email <value> }`.
 - `caddy_tls_internal` — optional. Adds `tls internal` to all Caddyfile host blocks.
+- `ingressTypes` — optional. Maps custom `ingressClassName` values to canonical rewriter names (e.g. `haproxy-controller-internal: haproxy`). Without this, only exact matches work.
 - `disableCaddy: true` — optional, manual only (never auto-generated). Skips Caddy service, writes Ingress rules to `Caddyfile-<project>`.
 - `network: <name>` — optional. Overrides the default compose network with an external one.
 - `core_version: v2.1.0` — optional. Pins the h2c-core version for h2c-manager (ignored by h2c-core itself).

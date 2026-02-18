@@ -1038,100 +1038,173 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
     return port_map
 
 
-def _extract_strip_prefix(annotations: dict, path: str) -> str | None:
-    """Extract a strip prefix from ingress rewrite annotations."""
-    # haproxy.org/path-rewrite: /api/(.*) /\1  →  strip "/api"
-    rewrite = annotations.get("haproxy.org/path-rewrite", "")
-    if rewrite:
-        parts = rewrite.split()
-        if len(parts) == 2 and parts[1] in (r"/\1", "/$1"):
-            # The prefix is the path without the regex capture group
-            prefix = re.sub(r'\(\.?\*\)$', '', parts[0])
-            if prefix and prefix != "/":
-                return prefix.rstrip("/")
-    # nginx.ingress.kubernetes.io/rewrite-target: /$1
-    rewrite = annotations.get("nginx.ingress.kubernetes.io/rewrite-target", "")
-    if rewrite in ("/$1", r"/\1"):
-        prefix = re.sub(r'\(\.?\*\)$', '', path)
-        if prefix and prefix != "/":
-            return prefix.rstrip("/")
-    return None
+class IngressRewriter:
+    """Base class for ingress annotation rewriters.
+
+    Subclass to support a specific ingress controller. Each rewriter
+    translates controller-specific annotations into Caddy entries.
+    """
+    name: str = ""
+    priority: int = 100
+
+    def match(self, manifest: dict, ctx: ConvertContext) -> bool:
+        """Return True if this rewriter handles this Ingress manifest."""
+        return False
+
+    def rewrite(self, manifest: dict, ctx: ConvertContext) -> list[dict]:
+        """Convert one Ingress manifest to Caddy entries.
+
+        Each entry dict must have: host, path, upstream, scheme.
+        Optional: server_ca_secret, server_sni, strip_prefix, extra_directives.
+        extra_directives is a list of raw Caddy directive strings.
+        """
+        return []
 
 
-def _convert_one_ingress(manifest: dict, service_port_map: dict,
-                         alias_map: dict[str, str] | None = None,
-                         services_by_selector: dict | None = None) -> list[dict]:
-    """Convert a single Ingress manifest to Caddyfile entries."""
-    entries = []
-    meta = manifest.get("metadata", {})
-    annotations = meta.get("annotations", {})
-    ns = meta.get("namespace", "")
+class _NullRewriter(IngressRewriter):
+    """No-op fallback rewriter — returns empty entries."""
+    name = "_null"
+
+    def match(self, manifest, ctx):
+        return True
+
+    def rewrite(self, manifest, ctx):
+        return []
+
+
+def get_ingress_class(manifest: dict,
+                      ingress_types: dict[str, str] | None = None) -> str:
+    """Extract the ingress class from a manifest (spec or annotation).
+
+    If *ingress_types* is provided, custom class names are resolved to
+    canonical rewriter names (e.g. ``haproxy-internal`` → ``haproxy``).
+    """
     spec = manifest.get("spec", {})
-    rules = spec.get("rules", [])
-    tls_hosts = set()
-    for tls in spec.get("tls", []):
-        for h in tls.get("hosts", []):
-            tls_hosts.add(h)
+    cls = spec.get("ingressClassName", "")
+    if not cls:
+        cls = manifest.get("metadata", {}).get("annotations", {}).get(
+            "kubernetes.io/ingress.class", "")
+    cls = cls.lower()
+    if ingress_types and cls in ingress_types:
+        cls = ingress_types[cls].lower()
+    return cls
 
-    for rule in rules:
-        host = rule.get("host", "")
-        if not host:
-            continue
-        http = rule.get("http", {})
-        for path_entry in http.get("paths", []):
-            path = path_entry.get("path", "/")
-            backend = path_entry.get("backend", {})
-            # Handle both v1 and v1beta1 ingress backend format
-            if "service" in backend:
-                svc_name = backend["service"].get("name", "")
-                port = backend["service"].get("port", {})
-                svc_port = port.get("number", port.get("name", 80))
-            else:
-                svc_name = backend.get("serviceName", "")
-                svc_port = backend.get("servicePort", 80)
 
-            # Resolve K8s Service name → compose service name
-            compose_name = (alias_map or {}).get(svc_name, svc_name)
+def resolve_backend(path_entry: dict, manifest: dict,
+                    ctx: ConvertContext) -> dict:
+    """Resolve an Ingress path entry to upstream components.
 
-            # Resolve to container port (Service port → targetPort → containerPort)
-            container_port = service_port_map.get((svc_name, svc_port), svc_port)
+    Returns a dict with: svc_name, compose_name, container_port,
+    upstream (host:port string), ns.
+    Handles both v1 and v1beta1 Ingress backend formats.
+    """
+    ns = manifest.get("metadata", {}).get("namespace", "")
+    backend = path_entry.get("backend", {})
+    if "service" in backend:
+        svc_name = backend["service"].get("name", "")
+        port = backend["service"].get("port", {})
+        svc_port = port.get("number", port.get("name", 80))
+    else:
+        svc_name = backend.get("serviceName", "")
+        svc_port = backend.get("servicePort", 80)
 
-            # Upstream uses FQDN: compose DNS resolves it via network aliases
-            svc_ns = (services_by_selector or {}).get(svc_name, {}).get("namespace", "") or ns
-            if svc_ns:
-                upstream_host = f"{svc_name}.{svc_ns}.svc.cluster.local"
-            else:
-                upstream_host = compose_name
+    compose_name = ctx.alias_map.get(svc_name, svc_name)
+    container_port = ctx.service_port_map.get(
+        (svc_name, svc_port), svc_port)
 
-            # Upstream scheme: detect backend SSL from ingress annotations
-            backend_ssl = (
-                annotations.get("haproxy.org/server-ssl", "").lower() == "true"
-                or annotations.get(
-                    "nginx.ingress.kubernetes.io/backend-protocol", ""
-                ).upper() == "HTTPS"
-            )
-            scheme = "https" if backend_ssl else "http"
-            # Backend CA: haproxy.org/server-ca → "namespace/secretName"
-            server_ca_ref = annotations.get("haproxy.org/server-ca", "")
-            server_ca_secret = ""
-            if backend_ssl and server_ca_ref:
-                # Extract secret name (ignore namespace prefix)
-                server_ca_secret = server_ca_ref.split("/")[-1]
-            # TLS server name: only set when explicitly specified in annotation
-            server_sni = ""
-            if backend_ssl and server_ca_ref:
-                server_sni = annotations.get("haproxy.org/server-sni", "")
-            strip_prefix = _extract_strip_prefix(annotations, path)
-            entries.append({
-                "host": host,
-                "path": path,
-                "upstream": f"{upstream_host}:{container_port}",
-                "scheme": scheme,
-                "server_ca_secret": server_ca_secret,
-                "server_sni": server_sni,
-                "strip_prefix": strip_prefix,
-            })
-    return entries
+    svc_ns = ctx.services_by_selector.get(
+        svc_name, {}).get("namespace", "") or ns
+    if svc_ns:
+        upstream_host = f"{svc_name}.{svc_ns}.svc.cluster.local"
+    else:
+        upstream_host = compose_name
+
+    return {
+        "svc_name": svc_name,
+        "compose_name": compose_name,
+        "container_port": container_port,
+        "upstream": f"{upstream_host}:{container_port}",
+        "ns": svc_ns or ns,
+    }
+
+
+class HAProxyRewriter(IngressRewriter):
+    """Rewrite haproxy.org ingress annotations to Caddy entries."""
+    name = "haproxy"
+
+    def match(self, manifest, ctx):
+        ingress_types = ctx.config.get("ingressTypes", {})
+        cls = get_ingress_class(manifest, ingress_types)
+        if cls in ("haproxy", ""):
+            return True
+        annotations = manifest.get("metadata", {}).get("annotations", {})
+        return any(k.startswith("haproxy.org/") for k in annotations)
+
+    def rewrite(self, manifest, ctx):
+        entries = []
+        annotations = manifest.get("metadata", {}).get("annotations", {})
+        spec = manifest.get("spec", {})
+
+        for rule in spec.get("rules", []):
+            host = rule.get("host", "")
+            if not host:
+                continue
+            for path_entry in rule.get("http", {}).get("paths", []):
+                path = path_entry.get("path", "/")
+                backend = resolve_backend(path_entry, manifest, ctx)
+
+                # Backend SSL from haproxy annotations
+                backend_ssl = (
+                    annotations.get("haproxy.org/server-ssl", "").lower() == "true"
+                )
+                scheme = "https" if backend_ssl else "http"
+                # Backend CA: haproxy.org/server-ca → "namespace/secretName"
+                server_ca_ref = annotations.get("haproxy.org/server-ca", "")
+                server_ca_secret = ""
+                if backend_ssl and server_ca_ref:
+                    server_ca_secret = server_ca_ref.split("/")[-1]
+                server_sni = ""
+                if backend_ssl and server_ca_ref:
+                    server_sni = annotations.get("haproxy.org/server-sni", "")
+
+                strip_prefix = self._extract_strip_prefix(annotations)
+                entries.append({
+                    "host": host,
+                    "path": path,
+                    "upstream": backend["upstream"],
+                    "scheme": scheme,
+                    "server_ca_secret": server_ca_secret,
+                    "server_sni": server_sni,
+                    "strip_prefix": strip_prefix,
+                })
+        return entries
+
+    @staticmethod
+    def _extract_strip_prefix(annotations):
+        """Extract strip prefix from haproxy.org/path-rewrite annotation."""
+        rewrite = annotations.get("haproxy.org/path-rewrite", "")
+        if rewrite:
+            parts = rewrite.split()
+            if len(parts) == 2 and parts[1] in (r"/\1", "/$1"):
+                prefix = re.sub(r'\(\.?\*\)$', '', parts[0])
+                if prefix and prefix != "/":
+                    return prefix.rstrip("/")
+        return None
+
+
+# Rewriter instances — dispatched by IngressConverter per manifest
+_REWRITERS: list[IngressRewriter] = []
+_REWRITERS.append(HAProxyRewriter())
+
+
+def _is_rewriter_class(obj, mod_name):
+    """Check if obj is an ingress rewriter class defined in the given module."""
+    return (isinstance(obj, type)
+            and hasattr(obj, 'name') and isinstance(getattr(obj, 'name', None), str)
+            and hasattr(obj, 'match') and callable(obj.match)
+            and hasattr(obj, 'rewrite') and callable(obj.rewrite)
+            and not hasattr(obj, 'kinds')
+            and obj.__module__ == mod_name)
 
 
 class IngressConverter:
@@ -1142,9 +1215,8 @@ class IngressConverter:
         """Convert all Ingress manifests."""
         entries = []
         for m in manifests:
-            entries.extend(_convert_one_ingress(m, ctx.service_port_map,
-                                                alias_map=ctx.alias_map,
-                                                services_by_selector=ctx.services_by_selector))
+            rewriter = self._find_rewriter(m, ctx)
+            entries.extend(rewriter.rewrite(m, ctx))
         services = {}
         if entries and not ctx.config.get("disableCaddy"):
             volume_root = ctx.config.get("volume_root", "./data")
@@ -1166,6 +1238,16 @@ class IngressConverter:
                 "volumes": caddy_volumes,
             }
         return ConvertResult(services=services, caddy_entries=entries)
+
+    @staticmethod
+    def _find_rewriter(manifest, ctx):
+        """Find the first matching rewriter for an Ingress manifest."""
+        for rw in _REWRITERS:
+            if rw.match(manifest, ctx):
+                return rw
+        name = manifest.get("metadata", {}).get("name", "?")
+        ctx.warnings.append(f"Ingress '{name}': no matching rewriter, skipped")
+        return _NullRewriter()
 
 
 # Populate converter registry now that classes are defined
@@ -1208,9 +1290,10 @@ def _is_transform_class(obj, mod_name):
 
 
 def _load_extensions(extensions_dir):
-    """Load converter and transform classes from an extensions directory."""
+    """Load converter, transform, and rewriter classes from an extensions directory."""
     converters = []
     transforms = []
+    rewriters = []
     for filepath in _discover_extension_files(extensions_dir):
         parent = str(Path(filepath).parent)
         if parent not in sys.path:
@@ -1229,12 +1312,15 @@ def _load_extensions(extensions_dir):
             obj = getattr(module, attr_name)
             if _is_converter_class(obj, mod_name):
                 converters.append(obj())
+            elif _is_rewriter_class(obj, mod_name):
+                rewriters.append(obj())
             elif _is_transform_class(obj, mod_name):
                 transforms.append(obj())
 
     # Sort by priority (lower = earlier). Default 100.
     converters.sort(key=lambda c: getattr(c, 'priority', 100))
     transforms.sort(key=lambda t: getattr(t, 'priority', 100))
+    rewriters.sort(key=lambda r: getattr(r, 'priority', 100))
     if converters:
         loaded = ", ".join(
             f"{type(c).__name__} ({', '.join(c.kinds)})" for c in converters)
@@ -1242,7 +1328,11 @@ def _load_extensions(extensions_dir):
     if transforms:
         loaded = ", ".join(type(t).__name__ for t in transforms)
         print(f"Loaded transforms: {loaded}", file=sys.stderr)
-    return converters, transforms
+    if rewriters:
+        loaded = ", ".join(
+            f"{type(r).__name__} ({r.name})" for r in rewriters)
+        print(f"Loaded rewriters: {loaded}", file=sys.stderr)
+    return converters, transforms, rewriters
 
 
 def _resolve_volume_root(obj, volume_root: str):
@@ -1548,9 +1638,13 @@ def _write_caddy_host_block(f, host: str, host_entries: list[dict],
         f.write(f"\thandle {entry['path']}* {{\n")
         if entry.get("strip_prefix"):
             f.write(f"\t\turi strip_prefix {entry['strip_prefix']}\n")
+        for directive in entry.get("extra_directives", []):
+            f.write(f"\t\t{directive}\n")
         _write_caddy_reverse_proxy(f, entry, indent="\t\t")
         f.write("\t}\n")
     for entry in catchall:
+        for directive in entry.get("extra_directives", []):
+            f.write(f"\t{directive}\n")
         _write_caddy_reverse_proxy(f, entry)
     f.write("}\n\n")
 
@@ -1610,6 +1704,41 @@ def _init_first_run(config: dict, manifests: dict, args) -> None:
         )
 
 
+def _register_extensions(extra_converters, extra_transforms, extra_rewriters):
+    """Register loaded extensions into global registries."""
+    _TRANSFORMS.extend(extra_transforms)
+    # Rewriter override: external rewriter with same name replaces built-in
+    if extra_rewriters:
+        ext_rewriter_names = {rw.name for rw in extra_rewriters}
+        overridden_rw = ext_rewriter_names & {rw.name for rw in _REWRITERS}
+        if overridden_rw:
+            _REWRITERS[:] = [rw for rw in _REWRITERS if rw.name not in ext_rewriter_names]
+            for name in sorted(overridden_rw):
+                print(f"Rewriter overrides built-in: {name}", file=sys.stderr)
+        _REWRITERS[0:0] = extra_rewriters
+    # Check for duplicate kind claims between extensions
+    ext_kind_owners: dict[str, str] = {}
+    for c in extra_converters:
+        for k in c.kinds:
+            if k in ext_kind_owners:
+                print(f"Error: kind '{k}' claimed by both "
+                      f"{ext_kind_owners[k]} and "
+                      f"{type(c).__name__} (extensions)",
+                      file=sys.stderr)
+                sys.exit(1)
+            ext_kind_owners[k] = type(c).__name__
+    # Extensions override built-in converters for the same kind
+    overridden = set(ext_kind_owners)
+    for c in _CONVERTERS:
+        lost = overridden & set(c.kinds)
+        if lost:
+            c.kinds = [k for k in c.kinds if k not in overridden]
+            print(f"Extension overrides built-in {type(c).__name__} "
+                  f"for: {', '.join(sorted(lost))}")
+    _CONVERTERS[0:0] = extra_converters
+    CONVERTED_KINDS.update(k for c in extra_converters for k in c.kinds)
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -1637,7 +1766,7 @@ def main():
     )
     parser.add_argument(
         "--extensions-dir",
-        help="Directory containing h2c extension modules (operators, ingress converters)",
+        help="Directory containing h2c extension modules (converters, transforms, rewriters)",
     )
     args = parser.parse_args()
 
@@ -1670,29 +1799,8 @@ def main():
         if not os.path.isdir(args.extensions_dir):
             print(f"Extensions directory not found: {args.extensions_dir}", file=sys.stderr)
             sys.exit(1)
-        extra_converters, extra_transforms = _load_extensions(args.extensions_dir)
-        _TRANSFORMS.extend(extra_transforms)
-        # Check for duplicate kind claims between extensions
-        ext_kind_owners: dict[str, str] = {}
-        for c in extra_converters:
-            for k in c.kinds:
-                if k in ext_kind_owners:
-                    print(f"Error: kind '{k}' claimed by both "
-                          f"{ext_kind_owners[k]} and "
-                          f"{type(c).__name__} (extensions)",
-                          file=sys.stderr)
-                    sys.exit(1)
-                ext_kind_owners[k] = type(c).__name__
-        # Extensions override built-in converters for the same kind
-        overridden = set(ext_kind_owners)
-        for c in _CONVERTERS:
-            lost = overridden & set(c.kinds)
-            if lost:
-                c.kinds = [k for k in c.kinds if k not in overridden]
-                print(f"Extension overrides built-in {type(c).__name__} "
-                      f"for: {', '.join(sorted(lost))}")
-        _CONVERTERS[0:0] = extra_converters
-        CONVERTED_KINDS.update(k for c in extra_converters for k in c.kinds)
+        extra_converters, extra_transforms, extra_rewriters = _load_extensions(args.extensions_dir)
+        _register_extensions(extra_converters, extra_transforms, extra_rewriters)
 
     # Step 4: convert
     services, caddy_entries, warnings = convert(manifests, config, output_dir=args.output_dir)
