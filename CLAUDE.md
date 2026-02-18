@@ -5,17 +5,17 @@ Convert `helmfile template` output to `compose.yml` + `Caddyfile`.
 Part of the [helmfile2compose](https://github.com/helmfile2compose) org. This repo contains the core converter script only. Related repos:
 - [h2c-manager](https://github.com/helmfile2compose/h2c-manager) — package manager + extension registry (`extensions.json`)
 - [helmfile2compose.github.io](https://github.com/helmfile2compose/helmfile2compose.github.io) — full documentation site
-- Extension repos: [h2c-provider-keycloak](https://github.com/helmfile2compose/h2c-provider-keycloak), [h2c-provider-servicemonitor](https://github.com/helmfile2compose/h2c-provider-servicemonitor), [h2c-converter-cert-manager](https://github.com/helmfile2compose/h2c-converter-cert-manager), [h2c-converter-trust-manager](https://github.com/helmfile2compose/h2c-converter-trust-manager)
+- Extension repos: [h2c-provider-keycloak](https://github.com/helmfile2compose/h2c-provider-keycloak), [h2c-provider-servicemonitor](https://github.com/helmfile2compose/h2c-provider-servicemonitor), [h2c-converter-cert-manager](https://github.com/helmfile2compose/h2c-converter-cert-manager), [h2c-converter-trust-manager](https://github.com/helmfile2compose/h2c-converter-trust-manager), [h2c-transform-bitnami](https://github.com/helmfile2compose/h2c-transform-bitnami)
 
 ## Workflow
 
 Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
-Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 5 C-rated functions, average C (~12).
+Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 14 C-rated functions, average C (~14).
 
 ## What exists
 
-Single script `helmfile2compose.py` (~1500 lines). No packages, no setup.py. Dependency: `pyyaml`.
+Single script `helmfile2compose.py` (~1860 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -72,10 +72,11 @@ Extensions import `ConvertContext`/`ConvertResult`/`IngressRewriter` from `helmf
 - **trust-manager** — converter: `Bundle` (priority 20, depends on cert-manager)
 - **servicemonitor** — provider: `Prometheus`, `ServiceMonitor` (priority 60, requires `pyyaml`)
 - **flatten-internal-urls** — transform: strip aliases, rewrite FQDNs (priority 200, incompatible with cert-manager)
+- **bitnami** — transform: Bitnami Redis, PostgreSQL, Keycloak workarounds (priority 150)
 - **nginx** — ingress rewriter: Nginx annotations (rewrite-target, backend-protocol, CORS, proxy-body-size)
 - **traefik** — ingress rewriter: Traefik annotations (router.tls, standard path rules). POC.
 
-Install via h2c-manager: `python3 h2c-manager.py keycloak cert-manager trust-manager servicemonitor flatten-internal-urls nginx traefik`
+Install via h2c-manager: `python3 h2c-manager.py keycloak cert-manager trust-manager servicemonitor flatten-internal-urls bitnami nginx traefik`
 
 ### Config file (`helmfile2compose.yaml`)
 
@@ -143,8 +144,9 @@ services:                 # custom services added to compose (not from K8s)
 - Real `helmfile template` output from `~/stoat-platform` (~15 services)
 - Real `helmfile template` output from `~/suite-helmfile` (~16 charts, 22 services + 11 init jobs)
 - Real `helmfile template` output from pa-helm-deploy (operators, cert-manager, trust-manager, backend SSL)
+- Real `helmfile template` output from mijn-bureau-infra (~30 services, nested helmfiles, Bitnami charts)
 - `docker compose config` validates generated output for all projects
-- Regression tests: known-good output in `/tmp/h2c-regression/{stoat,lasuite}/`
+- Regression test suite: h2c-testsuite compares pinned reference versions against latest across all extension combos
 
 ## Out of scope
 

@@ -275,7 +275,7 @@ def load_config(path: str) -> dict:
 
 def save_config(path: str, config: dict) -> None:
     """Write helmfile2compose.yaml."""
-    header = "# Configuration descriptor for https://github.com/baptisterajaut/helmfile2compose\n\n"
+    header = "# Configuration descriptor for https://github.com/helmfile2compose\n\n"
     # Ensure version key comes first
     ordered = {"helmfile2ComposeVersion": config.get("helmfile2ComposeVersion", "v1")}
     for k, v in config.items():
