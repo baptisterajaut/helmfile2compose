@@ -78,7 +78,7 @@ def parse_manifests(rendered_dir: str) -> dict[str, list[dict]]:
         rel = yaml_file.relative_to(rendered)
         release_dir = rel.parts[0] if rel.parts else ""
         try:
-            with open(yaml_file) as f:
+            with open(yaml_file, encoding="utf-8") as f:
                 for doc in yaml.safe_load_all(f):
                     if not doc or not isinstance(doc, dict):
                         continue

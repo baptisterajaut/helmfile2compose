@@ -108,9 +108,22 @@ def main():
         all_bodies.append(f"\n# --- {section} ---\n")
         all_bodies.extend(body)
 
+    # Sort imports: stdlib before third-party (pylint C0411)
+    stdlib_imports = []
+    thirdparty_imports = []
+    for imp in all_imports.values():
+        module = imp.strip().split()[1].split(".")[0]
+        if module == "yaml":
+            thirdparty_imports.append(imp)
+        else:
+            stdlib_imports.append(imp)
+
     # Assemble
     lines = [SHEBANG, DOCSTRING, PYLINT_DISABLE, "\n"]
-    lines.extend(all_imports.values())
+    lines.extend(stdlib_imports)
+    if thirdparty_imports:
+        lines.append("\n")
+        lines.extend(thirdparty_imports)
     lines.append("\n")
     lines.extend(all_bodies)
 

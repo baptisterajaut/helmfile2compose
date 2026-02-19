@@ -8,7 +8,7 @@ import yaml
 def load_config(path: str) -> dict:
     """Load helmfile2compose.yaml or return empty config."""
     if os.path.exists(path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
     else:
         cfg = {}

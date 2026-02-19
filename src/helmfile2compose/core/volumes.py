@@ -57,7 +57,7 @@ def _convert_pvc_mount(claim: str, mount_path: str, pvc_names: set,
 
 
 def _generate_configmap_files(cm_name: str, cm_data: dict, output_dir: str,
-                              generated_cms: set, warnings: list[str],
+                              generated_cms: set,
                               replacements: list[dict] | None = None,
                               service_port_map: dict | None = None) -> str:
     """Write ConfigMap data entries as files. Returns the directory path (relative)."""
@@ -153,7 +153,7 @@ def _convert_volume_mounts(volume_mounts: list, pod_volumes: list, pvc_names: se
                 warnings.append(f"ConfigMap '{source['name']}' referenced by {workload_name} not found")
                 continue
             cm_dir = _generate_configmap_files(source["name"], cm.get("data") or {},
-                                               output_dir, generated_cms, warnings,
+                                               output_dir, generated_cms,
                                                replacements=replacements,
                                                service_port_map=service_port_map)
             result.append(_convert_data_mount(cm_dir, vm))
