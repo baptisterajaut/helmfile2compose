@@ -19,6 +19,7 @@ MODULES = [
     "core/volumes.py",
     "core/services.py",
     "core/workloads.py",
+    "core/haproxy.py",
     "core/ingress.py",
     "core/extensions.py",
     "core/convert.py",

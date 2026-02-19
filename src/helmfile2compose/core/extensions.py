@@ -5,7 +5,6 @@ import os
 import sys
 from pathlib import Path
 
-from helmfile2compose.pacts.ingress import IngressRewriter
 from helmfile2compose.core.ingress import _is_rewriter_class
 
 
@@ -43,38 +42,39 @@ def _is_transform_class(obj, mod_name):
             and obj.__module__ == mod_name)
 
 
-def _load_extensions(extensions_dir):
-    """Load converter, transform, and rewriter classes from an extensions directory."""
-    converters = []
-    transforms = []
-    rewriters = []
-    for filepath in _discover_extension_files(extensions_dir):
-        parent = str(Path(filepath).parent)
-        if parent not in sys.path:
-            sys.path.insert(0, parent)
-        mod_name = f"h2c_op_{Path(filepath).stem}"
-        spec = importlib.util.spec_from_file_location(mod_name, filepath)
-        if spec is None or spec.loader is None:
-            continue
-        try:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"Warning: failed to load {filepath}: {exc}", file=sys.stderr)
-            continue
-        for attr_name in dir(module):
-            obj = getattr(module, attr_name)
-            if _is_converter_class(obj, mod_name):
-                converters.append(obj())
-            elif _is_rewriter_class(obj, mod_name):
-                rewriters.append(obj())
-            elif _is_transform_class(obj, mod_name):
-                transforms.append(obj())
+def _load_module(filepath):
+    """Load a single extension module, return it or None on failure."""
+    parent = str(Path(filepath).parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    mod_name = f"h2c_op_{Path(filepath).stem}"
+    spec = importlib.util.spec_from_file_location(mod_name, filepath)
+    if spec is None or spec.loader is None:
+        return None
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Warning: failed to load {filepath}: {exc}", file=sys.stderr)
+        return None
 
-    # Sort by priority (lower = earlier). Default 100.
-    converters.sort(key=lambda c: getattr(c, 'priority', 100))
-    transforms.sort(key=lambda t: getattr(t, 'priority', 100))
-    rewriters.sort(key=lambda r: getattr(r, 'priority', 100))
+
+def _classify_module(module, converters, transforms, rewriters):
+    """Classify classes in a module into converters, transforms, and rewriters."""
+    mod_name = module.__name__
+    for attr_name in dir(module):
+        obj = getattr(module, attr_name)
+        if _is_converter_class(obj, mod_name):
+            converters.append(obj())
+        elif _is_rewriter_class(obj, mod_name):
+            rewriters.append(obj())
+        elif _is_transform_class(obj, mod_name):
+            transforms.append(obj())
+
+
+def _log_loaded(converters, transforms, rewriters):
+    """Log loaded extension classes to stderr."""
     if converters:
         loaded = ", ".join(
             f"{type(c).__name__} ({', '.join(c.kinds)})" for c in converters)
@@ -86,23 +86,41 @@ def _load_extensions(extensions_dir):
         loaded = ", ".join(
             f"{type(r).__name__} ({r.name})" for r in rewriters)
         print(f"Loaded rewriters: {loaded}", file=sys.stderr)
+
+
+def _load_extensions(extensions_dir):
+    """Load converter, transform, and rewriter classes from an extensions directory."""
+    converters = []
+    transforms = []
+    rewriters = []
+    for filepath in _discover_extension_files(extensions_dir):
+        module = _load_module(filepath)
+        if module:
+            _classify_module(module, converters, transforms, rewriters)
+
+    # Sort by priority (lower = earlier). Default 100.
+    converters.sort(key=lambda c: getattr(c, 'priority', 100))
+    transforms.sort(key=lambda t: getattr(t, 'priority', 100))
+    rewriters.sort(key=lambda r: getattr(r, 'priority', 100))
+    _log_loaded(converters, transforms, rewriters)
     return converters, transforms, rewriters
 
 
-def _register_extensions(extra_converters, extra_transforms, extra_rewriters,
-                         converters, transforms, rewriters, converted_kinds):
-    """Register loaded extensions into the provided registries."""
-    transforms.extend(extra_transforms)
-    # Rewriter override: external rewriter with same name replaces built-in
-    if extra_rewriters:
-        ext_rewriter_names = {rw.name for rw in extra_rewriters}
-        overridden_rw = ext_rewriter_names & {rw.name for rw in rewriters}
-        if overridden_rw:
-            rewriters[:] = [rw for rw in rewriters if rw.name not in ext_rewriter_names]
-            for name in sorted(overridden_rw):
-                print(f"Rewriter overrides built-in: {name}", file=sys.stderr)
-        rewriters[0:0] = extra_rewriters
-    # Check for duplicate kind claims between extensions
+def _override_rewriters(extra_rewriters, rewriters):
+    """Override built-in rewriters with external ones sharing the same name."""
+    if not extra_rewriters:
+        return
+    ext_names = {rw.name for rw in extra_rewriters}
+    overridden = ext_names & {rw.name for rw in rewriters}
+    if overridden:
+        rewriters[:] = [rw for rw in rewriters if rw.name not in ext_names]
+        for name in sorted(overridden):
+            print(f"Rewriter overrides built-in: {name}", file=sys.stderr)
+    rewriters[0:0] = extra_rewriters
+
+
+def _check_duplicate_kinds(extra_converters):
+    """Check for duplicate kind claims between extension converters. Exits on conflict."""
     ext_kind_owners: dict[str, str] = {}
     for c in extra_converters:
         for k in c.kinds:
@@ -113,7 +131,11 @@ def _register_extensions(extra_converters, extra_transforms, extra_rewriters,
                       file=sys.stderr)
                 sys.exit(1)
             ext_kind_owners[k] = type(c).__name__
-    # Extensions override built-in converters for the same kind
+    return ext_kind_owners
+
+
+def _override_converters(ext_kind_owners, converters):
+    """Override built-in converters for kinds claimed by extensions."""
     overridden = set(ext_kind_owners)
     for c in converters:
         lost = overridden & set(c.kinds)
@@ -121,5 +143,14 @@ def _register_extensions(extra_converters, extra_transforms, extra_rewriters,
             c.kinds = [k for k in c.kinds if k not in overridden]
             print(f"Extension overrides built-in {type(c).__name__} "
                   f"for: {', '.join(sorted(lost))}", file=sys.stderr)
+
+
+def _register_extensions(extra_converters, extra_transforms, extra_rewriters,
+                         converters, transforms, rewriters, converted_kinds):
+    """Register loaded extensions into the provided registries."""
+    transforms.extend(extra_transforms)
+    _override_rewriters(extra_rewriters, rewriters)
+    ext_kind_owners = _check_duplicate_kinds(extra_converters)
+    _override_converters(ext_kind_owners, converters)
     converters[0:0] = extra_converters
     converted_kinds.update(k for c in extra_converters for k in c.kinds)

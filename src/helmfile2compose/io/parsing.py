@@ -119,16 +119,15 @@ def _collect_known_namespaces(manifests: dict[str, list[dict]]) -> set[str]:
     return known
 
 
-def _infer_namespaces(manifests: dict[str, list[dict]],
-                      release_ns_map: dict[str, str] | None = None) -> None:
-    """Fill missing ``metadata.namespace`` from sibling manifests or *release_ns_map*.
+def _build_dir_ns_map(manifests: dict[str, list[dict]],
+                      release_ns_map: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a mapping of release directory → namespace.
 
     Strategy (each phase fills gaps left by the previous):
     1. Sibling inference — any manifest in the same release dir that has a namespace
     2. Namespace/release matching — match release name against known namespaces
     3. ``helmfile list`` data — from *release_ns_map* (only when using ``--helmfile-dir``)
     """
-    # Single pass: collect release dirs + build sibling namespace map
     all_release_dirs: set[str] = set()
     dir_ns: dict[str, str] = {}
     for kind_list in manifests.values():
@@ -140,7 +139,6 @@ def _infer_namespaces(manifests: dict[str, list[dict]],
                 if ns and rd not in dir_ns:
                     dir_ns[rd] = ns
 
-    # Match unresolved dirs against known namespaces, then helmfile list
     known_ns = _collect_known_namespaces(manifests)
     for rd in all_release_dirs - dir_ns.keys():
         release_name = _extract_release_name(rd)
@@ -148,8 +146,13 @@ def _infer_namespaces(manifests: dict[str, list[dict]],
             dir_ns[rd] = release_name
         elif release_ns_map and release_name in release_ns_map:
             dir_ns[rd] = release_ns_map[release_name]
+    return dir_ns
 
-    # Inject into manifests missing namespace
+
+def _infer_namespaces(manifests: dict[str, list[dict]],
+                      release_ns_map: dict[str, str] | None = None) -> None:
+    """Fill missing ``metadata.namespace`` from sibling manifests or *release_ns_map*."""
+    dir_ns = _build_dir_ns_map(manifests, release_ns_map)
     for kind_list in manifests.values():
         for m in kind_list:
             if not m.get("metadata", {}).get("namespace", ""):

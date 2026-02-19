@@ -2,11 +2,6 @@
 
 import base64
 
-from helmfile2compose.core.constants import _URL_BOUNDARY
-from helmfile2compose.pacts.types import ConvertContext
-
-import re
-
 
 def apply_replacements(text: str, replacements: list[dict]) -> str:
     """Apply user-defined string replacements from config."""

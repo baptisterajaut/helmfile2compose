@@ -124,8 +124,13 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
             if sp.get("name"):
                 port_map[(svc_name, sp["name"])] = target
 
-    # Add FQDN variants so _apply_port_remap matches both "svc:80" and
-    # "svc.ns.svc.cluster.local:80"
+    _expand_fqdn_keys(port_map, services_by_selector)
+    return port_map
+
+
+def _expand_fqdn_keys(port_map: dict, services_by_selector: dict) -> None:
+    """Add FQDN variants so _apply_port_remap matches both "svc:80" and
+    "svc.ns.svc.cluster.local:80"."""
     fqdn_entries: dict = {}
     for (svc_name, svc_port), container_port in port_map.items():
         ns = services_by_selector.get(svc_name, {}).get("namespace", "")
@@ -136,5 +141,3 @@ def _build_service_port_map(manifests: dict, services_by_selector: dict) -> dict
                      f"{svc_name}.{ns}"):
             fqdn_entries[(fqdn, svc_port)] = container_port
     port_map.update(fqdn_entries)
-
-    return port_map

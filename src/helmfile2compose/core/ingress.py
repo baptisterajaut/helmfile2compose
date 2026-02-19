@@ -1,9 +1,8 @@
-"""Ingress conversion — HAProxy rewriter, IngressConverter, rewriter dispatch."""
-
-import re
+"""Ingress conversion — rewriter dispatch, IngressConverter."""
 
 from helmfile2compose.pacts.types import ConvertContext, ConvertResult
-from helmfile2compose.pacts.ingress import IngressRewriter, get_ingress_class, resolve_backend
+from helmfile2compose.pacts.ingress import IngressRewriter
+from helmfile2compose.core.haproxy import HAProxyRewriter
 
 
 class _NullRewriter(IngressRewriter):
@@ -15,70 +14,6 @@ class _NullRewriter(IngressRewriter):
 
     def rewrite(self, manifest, ctx):
         return []
-
-
-class HAProxyRewriter(IngressRewriter):
-    """Rewrite haproxy.org ingress annotations to Caddy entries."""
-    name = "haproxy"
-
-    def match(self, manifest, ctx):
-        ingress_types = ctx.config.get("ingressTypes", {})
-        cls = get_ingress_class(manifest, ingress_types)
-        if cls in ("haproxy", ""):
-            return True
-        annotations = manifest.get("metadata", {}).get("annotations") or {}
-        return any(k.startswith("haproxy.org/") for k in annotations)
-
-    def rewrite(self, manifest, ctx):
-        entries = []
-        annotations = (manifest.get("metadata") or {}).get("annotations") or {}
-        spec = manifest.get("spec") or {}
-
-        for rule in spec.get("rules") or []:
-            host = rule.get("host", "")
-            if not host:
-                continue
-            for path_entry in (rule.get("http") or {}).get("paths") or []:
-                path = path_entry.get("path", "/")
-                backend = resolve_backend(path_entry, manifest, ctx)
-
-                # Backend SSL from haproxy annotations
-                backend_ssl = (
-                    annotations.get("haproxy.org/server-ssl", "").lower() == "true"
-                )
-                scheme = "https" if backend_ssl else "http"
-                # Backend CA: haproxy.org/server-ca → "namespace/secretName"
-                server_ca_ref = annotations.get("haproxy.org/server-ca", "")
-                server_ca_secret = ""
-                if backend_ssl and server_ca_ref:
-                    server_ca_secret = server_ca_ref.split("/")[-1]
-                server_sni = ""
-                if backend_ssl and server_ca_ref:
-                    server_sni = annotations.get("haproxy.org/server-sni", "")
-
-                strip_prefix = self._extract_strip_prefix(annotations)
-                entries.append({
-                    "host": host,
-                    "path": path,
-                    "upstream": backend["upstream"],
-                    "scheme": scheme,
-                    "server_ca_secret": server_ca_secret,
-                    "server_sni": server_sni,
-                    "strip_prefix": strip_prefix,
-                })
-        return entries
-
-    @staticmethod
-    def _extract_strip_prefix(annotations):
-        """Extract strip prefix from haproxy.org/path-rewrite annotation."""
-        rewrite = annotations.get("haproxy.org/path-rewrite", "")
-        if rewrite:
-            parts = rewrite.split()
-            if len(parts) == 2 and parts[1] in (r"/\1", "/$1"):
-                prefix = re.sub(r'\(\.?\*\)$', '', parts[0])
-                if prefix and prefix != "/":
-                    return prefix.rstrip("/")
-        return None
 
 
 # Rewriter instances — dispatched by IngressConverter per manifest

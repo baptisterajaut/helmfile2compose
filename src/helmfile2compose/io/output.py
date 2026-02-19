@@ -5,8 +5,6 @@ import sys
 
 import yaml
 
-from helmfile2compose.pacts.helpers import apply_replacements
-
 
 def write_compose(services: dict, config: dict, output_dir: str,
                   compose_file: str = "compose.yml") -> None:

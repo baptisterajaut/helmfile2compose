@@ -11,7 +11,7 @@ from helmfile2compose.core.services import (
     _build_alias_map, _build_network_aliases, _build_service_port_map,
 )
 from helmfile2compose.core.workloads import WorkloadConverter
-from helmfile2compose.core.ingress import IngressConverter, _REWRITERS
+from helmfile2compose.core.ingress import IngressConverter
 
 # Converter instances used by convert() — also drives CONVERTED_KINDS
 _CONVERTERS = []
@@ -151,26 +151,25 @@ def _emit_kind_warnings(manifests: dict, warnings: list[str]) -> None:
             warnings.append(f"unknown kind '{kind}' ({len(items)} manifest(s)) — skipped")
 
 
+def _register_pvc(claim: str, config: dict, pvc_names: set[str]) -> None:
+    """Register a single PVC claim in config if not already present."""
+    if claim and claim not in config.get("volumes", {}):
+        config.setdefault("volumes", {})[claim] = {"host_path": claim}
+        pvc_names.add(claim)
+
+
 def _preregister_pvcs(manifests: dict, config: dict) -> set[str]:
     """Pre-register PVCs in config so _convert_pvc_mount can resolve host_path on first run."""
     pvc_names: set[str] = set()
     for kind in WORKLOAD_KINDS:
         for m in manifests.get(kind, []):
             spec = m.get("spec", {})
-            # StatefulSet volumeClaimTemplates
             for vct in spec.get("volumeClaimTemplates", []):
-                claim = vct.get("metadata", {}).get("name", "")
-                if claim and claim not in config.get("volumes", {}):
-                    config.setdefault("volumes", {})[claim] = {"host_path": claim}
-                    pvc_names.add(claim)
-            # Regular PVC references in pod volumes
+                _register_pvc(vct.get("metadata", {}).get("name", ""), config, pvc_names)
             pod_vols = ((spec.get("template") or {}).get("spec") or {}).get("volumes") or []
             for v in pod_vols:
-                pvc = v.get("persistentVolumeClaim", {})
-                claim = pvc.get("claimName", "")
-                if claim and claim not in config.get("volumes", {}):
-                    config.setdefault("volumes", {})[claim] = {"host_path": claim}
-                    pvc_names.add(claim)
+                _register_pvc(v.get("persistentVolumeClaim", {}).get("claimName", ""),
+                              config, pvc_names)
     return pvc_names
 
 
@@ -211,24 +210,8 @@ def convert(manifests: dict[str, list[dict]], config: dict,
 
     # Add network aliases so K8s FQDNs resolve via compose DNS
     network_aliases = _build_network_aliases(ctx.services_by_selector, ctx.alias_map)
-    for svc_name, svc_aliases in network_aliases.items():
-        if svc_name in compose_services and "network_mode" not in compose_services[svc_name]:
-            if svc_aliases:
-                compose_services[svc_name]["networks"] = {"default": {"aliases": svc_aliases}}
-
-    # Warn for generated services that have no FQDN aliases (missing namespace)
-    for svc_name in compose_services:
-        if "network_mode" in compose_services[svc_name]:
-            continue  # sidecars don't get aliases
-        aliases = network_aliases.get(svc_name, [])
-        has_fqdn = any(".svc.cluster.local" in a for a in aliases)
-        if not has_fqdn and svc_name in ctx.services_by_selector:
-            warnings.append(
-                f"service '{svc_name}' has no FQDN aliases (namespace unknown) — "
-                f"other services referencing it by FQDN will fail to resolve. "
-                f"Fix your helmfile: add {{{{ .Release.Namespace }}}} to the "
-                f"chart's metadata.namespace, or use --helmfile-dir."
-            )
+    _inject_network_aliases(compose_services, network_aliases)
+    _warn_missing_fqdn(compose_services, network_aliases, ctx.services_by_selector, warnings)
 
     # Register discovered PVCs
     for pvc in sorted(pvc_names):
@@ -239,14 +222,42 @@ def convert(manifests: dict[str, list[dict]], config: dict,
     _emit_kind_warnings(manifests, warnings)
     _apply_overrides(compose_services, config, secrets, warnings)
 
-    # Linux hostname limit is 63 chars; compose uses the service name as hostname.
-    # Set an explicit shorter hostname to avoid sethostname failures.
-    for svc_name, svc in compose_services.items():
-        if len(svc_name) > 63 and "hostname" not in svc:
-            svc["hostname"] = svc_name[:63]
+    _truncate_hostnames(compose_services)
 
     # Run transforms (post-processing hooks) after all alias injection
     for transform_cls in _TRANSFORMS:
         transform_cls.transform(compose_services, caddy_entries, ctx)
 
     return compose_services, caddy_entries, warnings
+
+
+def _inject_network_aliases(compose_services: dict, network_aliases: dict) -> None:
+    """Add compose network aliases so K8s FQDNs resolve via compose DNS."""
+    for svc_name, svc_aliases in network_aliases.items():
+        if svc_name in compose_services and "network_mode" not in compose_services[svc_name]:
+            if svc_aliases:
+                compose_services[svc_name]["networks"] = {"default": {"aliases": svc_aliases}}
+
+
+def _warn_missing_fqdn(compose_services: dict, network_aliases: dict,
+                        services_by_selector: dict, warnings: list[str]) -> None:
+    """Warn for generated services that have no FQDN aliases (missing namespace)."""
+    for svc_name in compose_services:
+        if "network_mode" in compose_services[svc_name]:
+            continue  # sidecars don't get aliases
+        aliases = network_aliases.get(svc_name, [])
+        has_fqdn = any(".svc.cluster.local" in a for a in aliases)
+        if not has_fqdn and svc_name in services_by_selector:
+            warnings.append(
+                f"service '{svc_name}' has no FQDN aliases (namespace unknown) — "
+                f"other services referencing it by FQDN will fail to resolve. "
+                f"Fix your helmfile: add {{{{ .Release.Namespace }}}} to the "
+                f"chart's metadata.namespace, or use --helmfile-dir."
+            )
+
+
+def _truncate_hostnames(compose_services: dict) -> None:
+    """Set explicit shorter hostname for services >63 chars (Linux hostname limit)."""
+    for svc_name, svc in compose_services.items():
+        if len(svc_name) > 63 and "hostname" not in svc:
+            svc["hostname"] = svc_name[:63]
