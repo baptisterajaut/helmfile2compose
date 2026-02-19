@@ -1,0 +1,29 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Build single-file distribution
+        run: python build.py
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: helmfile2compose.py

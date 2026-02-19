@@ -56,6 +56,20 @@ CRDs (Keycloak, cert-manager, trust-manager) are handled by [external extensions
 - `helmfile2compose.yaml` — persistent config (volumes, excludes, overrides)
 - `configmaps/` / `secrets/` — generated files from volume mounts
 
+## Development
+
+The codebase is a Python package under `src/helmfile2compose/`. The single-file `helmfile2compose.py` is a build artifact produced by `build.py` — it concatenates the package into one file for distribution.
+
+```bash
+# Run from the package
+PYTHONPATH=src python -m helmfile2compose --help
+
+# Build the single-file distribution
+python build.py
+```
+
+See the [core architecture docs](https://helmfile2compose.github.io/developer/core-architecture/) for the full package structure.
+
 ## Documentation
 
 Full docs at [helmfile2compose.github.io](https://helmfile2compose.github.io).

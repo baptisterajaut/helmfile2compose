@@ -7,17 +7,36 @@ Part of the [helmfile2compose](https://github.com/helmfile2compose) org. This re
 - [helmfile2compose.github.io](https://github.com/helmfile2compose/helmfile2compose.github.io) — full documentation site
 - Extension repos: [h2c-provider-keycloak](https://github.com/helmfile2compose/h2c-provider-keycloak), [h2c-provider-servicemonitor](https://github.com/helmfile2compose/h2c-provider-servicemonitor), [h2c-converter-cert-manager](https://github.com/helmfile2compose/h2c-converter-cert-manager), [h2c-converter-trust-manager](https://github.com/helmfile2compose/h2c-converter-trust-manager), [h2c-transform-bitnami](https://github.com/helmfile2compose/h2c-transform-bitnami)
 
+## Package structure
+
+Python package under `src/helmfile2compose/` with three layers:
+
+- **`pacts/`** — public contracts for extensions (`ConvertContext`, `ConvertResult`, `IngressRewriter`, helpers). Stable API — extensions import from here (or from `helmfile2compose` directly via re-exports).
+- **`core/`** — internal conversion engine (`constants`, `env`, `volumes`, `services`, `workloads`, `ingress`, `extensions`, `convert`). Not public API.
+- **`io/`** — input/output (`parsing`, `config`, `output`). Not public API.
+- **`cli.py`** — CLI entry point.
+
+The single-file `helmfile2compose.py` is a **build artifact** produced by `build.py` (concat script). It is not committed — CI builds it on tag push and uploads as a release asset. Users and h2c-manager see no change.
+
+```bash
+# Development: run from package
+PYTHONPATH=src python -m helmfile2compose --from-dir /tmp/rendered --output-dir .
+
+# Build single-file distribution
+python build.py
+# → helmfile2compose.py (gitignored)
+
+# Validate with testsuite
+cd ../h2c-testsuite && ./run-tests.sh --local-core ../h2c-core/helmfile2compose.py
+```
+
+Dependency: `pyyaml`.
+
 ## Workflow
 
-Lint often: run `pylint helmfile2compose.py` and `pyflakes helmfile2compose.py` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
-
-Complexity: run `radon cc helmfile2compose.py -a -s -n C` to check cyclomatic complexity. Target: no D/E/F ratings. Current: 14 C-rated functions, average C (~14).
+Lint often: run `pylint src/helmfile2compose/` and `pyflakes src/helmfile2compose/` after any change. Fix real issues (unused imports, actual bugs, f-strings without placeholders). Pylint style warnings (too-many-locals, line-too-long, etc.) are acceptable.
 
 **Null-safe YAML access:** `.get("key", {})` returns `None` when the key exists with an explicit `null` value (Helm conditional blocks). Always use `.get("key") or {}` / `.get("key") or []` for fields that Helm may render as null (`annotations`, `ports`, `initContainers`, `data`, `rules`, `selector`, etc.).
-
-## What exists
-
-Single script `helmfile2compose.py` (~1860 lines). No packages, no setup.py. Dependency: `pyyaml`.
 
 ### CLI
 
@@ -70,10 +89,10 @@ Three extension types, loaded from the same `--extensions-dir`:
 
 Extensions import `ConvertContext`/`ConvertResult`/`IngressRewriter` from `helmfile2compose`. `get_ingress_class(manifest, ingress_types)` and `resolve_backend(path_entry, manifest, ctx)` are public helpers for rewriters. `apply_replacements(text, replacements)` and `resolve_env(container, configmaps, secrets, workload_name, warnings, replacements=None, service_port_map=None)` are also public — available to extensions that need string replacement or env resolution. Available extensions:
 - **keycloak** — provider: `Keycloak`, `KeycloakRealmImport` (priority 50)
-- **cert-manager** — converter: `Certificate`, `ClusterIssuer`, `Issuer` (priority 10, requires `cryptography`)
+- **cert-manager** — converter: `Certificate`, `ClusterIssuer`, `Issuer` (priority 10, requires `cryptography`, incompatible with flatten-internal-urls)
 - **trust-manager** — converter: `Bundle` (priority 20, depends on cert-manager)
 - **servicemonitor** — provider: `Prometheus`, `ServiceMonitor` (priority 60, requires `pyyaml`)
-- **flatten-internal-urls** — transform: strip aliases, rewrite FQDNs (priority 200, incompatible with cert-manager)
+- **flatten-internal-urls** — transform: strip aliases, rewrite FQDNs (priority 200)
 - **bitnami** — transform: Bitnami Redis, PostgreSQL, Keycloak workarounds (priority 150)
 - **nginx** — ingress rewriter: Nginx annotations (rewrite-target, backend-protocol, CORS, proxy-body-size)
 - **traefik** — ingress rewriter: Traefik annotations (router.tls, standard path rules). POC.
