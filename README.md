@@ -14,7 +14,7 @@ Core of the problem: feed it Kubernetes manifests (from `helmfile template`, `he
 
 ## Quick start
 
-Download `helmfile2compose.py` from the [latest release](https://github.com/helmfile2compose/h2c-core/releases/latest).
+Download `helmfile2compose.py` from the [latest release](https://github.com/helmfile2compose/helmfile2compose/releases/latest).
 
 ```bash
 # Convert from helmfile
