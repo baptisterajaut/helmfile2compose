@@ -3,11 +3,11 @@
 
 import fnmatch
 
-from helmfile2compose.pacts.types import ConvertContext, ConvertResult, Provider
-from helmfile2compose.core.constants import WORKLOAD_KINDS
-from helmfile2compose.core.env import resolve_env, _convert_command
-from helmfile2compose.core.volumes import _convert_volume_mounts, _build_vol_map
-from helmfile2compose.core.services import _resolve_named_port
+from h2c.pacts.types import ConvertContext, ConvertResult, Provider
+from h2c.core.constants import WORKLOAD_KINDS
+from h2c.core.env import resolve_env, _convert_command
+from h2c.core.volumes import _convert_volume_mounts, _build_vol_map
+from h2c.core.services import _resolve_named_port
 
 
 def _is_excluded(name: str, exclude_list: list[str]) -> bool:

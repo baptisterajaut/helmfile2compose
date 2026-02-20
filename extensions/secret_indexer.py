@@ -1,6 +1,6 @@
 """Secret indexer — populates ctx.secrets."""
 
-from helmfile2compose.pacts.types import ConvertResult, IndexerConverter
+from h2c.pacts.types import ConvertResult, IndexerConverter
 
 
 class SecretIndexer(IndexerConverter):

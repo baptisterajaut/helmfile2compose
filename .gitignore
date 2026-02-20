@@ -14,7 +14,7 @@ CLAUDE.local.md
 # Regression test outputs (contain resolved secrets)
 tests/regression/
 
-# Build artifact (produced by build.py)
+# Build artifacts
 helmfile2compose.py
 
 # Python

@@ -1,8 +1,8 @@
 """PVC indexer — pre-registers PersistentVolumeClaim and workload PVC references."""
 
-from helmfile2compose.pacts.types import ConvertResult, IndexerConverter
-from helmfile2compose.core.constants import WORKLOAD_KINDS
-from helmfile2compose.core.volumes import _register_pvc
+from h2c.pacts.types import ConvertResult, IndexerConverter
+from h2c.core.constants import WORKLOAD_KINDS
+from h2c.core.volumes import _register_pvc
 
 
 class PVCIndexer(IndexerConverter):

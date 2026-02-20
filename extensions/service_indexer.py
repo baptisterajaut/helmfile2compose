@@ -1,7 +1,7 @@
 """Service indexer — populates ctx.services_by_selector, ctx.alias_map, ctx.service_port_map."""
 
-from helmfile2compose.pacts.types import ConvertResult, IndexerConverter
-from helmfile2compose.core.services import _build_alias_map, _build_service_port_map
+from h2c.pacts.types import ConvertResult, IndexerConverter
+from h2c.core.services import _build_alias_map, _build_service_port_map
 
 
 class ServiceIndexer(IndexerConverter):

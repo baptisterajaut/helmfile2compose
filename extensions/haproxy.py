@@ -2,7 +2,7 @@
 
 import re
 
-from helmfile2compose.pacts.ingress import IngressRewriter, get_ingress_class, resolve_backend
+from h2c.pacts.ingress import IngressRewriter, get_ingress_class, resolve_backend
 
 
 def _resolve_backend_ssl(annotations: dict) -> dict:

@@ -3,7 +3,7 @@
 import os
 import sys
 
-from helmfile2compose.core.ingress import IngressProvider
+from h2c.core.ingress import IngressProvider
 
 
 class CaddyProvider(IngressProvider):

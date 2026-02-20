@@ -20,8 +20,13 @@ jobs:
       - name: Install dependencies
         run: pip install pyyaml
 
+      - name: Fetch build-distribution.py
+        run: |
+          curl -fsSL -o build-distribution.py \
+            https://github.com/helmfile2compose/h2c-core/releases/latest/download/build-distribution.py
+
       - name: Build distribution
-        run: python build.py
+        run: python build-distribution.py helmfile2compose --extensions-dir extensions
 
       - name: Upload release asset
         env:

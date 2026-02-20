@@ -1,6 +1,6 @@
 """ConfigMap indexer — populates ctx.configmaps."""
 
-from helmfile2compose.pacts.types import ConvertResult, IndexerConverter
+from h2c.pacts.types import ConvertResult, IndexerConverter
 
 
 class ConfigMapIndexer(IndexerConverter):
