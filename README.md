@@ -58,17 +58,19 @@ CRDs (Keycloak, cert-manager, trust-manager) are handled by [external extensions
 
 ## Development
 
-The codebase is a Python package under `src/helmfile2compose/`. The single-file `helmfile2compose.py` is a build artifact produced by `build.py` — it concatenates the package into one file for distribution.
+This repo contains built-in extensions under `extensions/`. The core engine lives in [h2c-core](https://github.com/helmfile2compose/h2c-core) (`src/h2c/`). The single-file `helmfile2compose.py` is a build artifact — h2c-core + extensions concatenated by `build-distribution.py`.
 
 ```bash
-# Run from the package
-PYTHONPATH=src python -m helmfile2compose --help
+# Build locally (reads core sources from sibling checkout)
+python ../h2c-core/build-distribution.py helmfile2compose \
+  --extensions-dir extensions --core-dir ../h2c-core
+# → helmfile2compose.py
 
-# Build the single-file distribution
-python build.py
+# Test it
+python helmfile2compose.py --from-dir /tmp/rendered --output-dir .
 ```
 
-See the [core architecture docs](https://helmfile2compose.github.io/developer/core-architecture/) for the full package structure.
+See the [distributions docs](https://helmfile2compose.github.io/developer/distributions/) and [core architecture](https://helmfile2compose.github.io/developer/core-architecture/) for the full picture.
 
 ## Documentation
 
@@ -78,15 +80,9 @@ Full docs at [helmfile2compose.github.io](https://helmfile2compose.github.io).
 
 | Repo | Description |
 |------|-------------|
+| [h2c-core](https://github.com/helmfile2compose/h2c-core) | Bare conversion engine (`h2c.py`) |
 | [h2c-manager](https://github.com/helmfile2compose/h2c-manager) | Package manager + extension registry |
 | [helmfile2compose.github.io](https://github.com/helmfile2compose/helmfile2compose.github.io) | Documentation site |
-| [h2c-provider-keycloak](https://github.com/helmfile2compose/h2c-provider-keycloak) | Keycloak CRD provider |
-| [h2c-converter-cert-manager](https://github.com/helmfile2compose/h2c-converter-cert-manager) | cert-manager CRD converter |
-| [h2c-converter-trust-manager](https://github.com/helmfile2compose/h2c-converter-trust-manager) | trust-manager CRD converter |
-| [h2c-provider-servicemonitor](https://github.com/helmfile2compose/h2c-provider-servicemonitor) | Prometheus & ServiceMonitor CRD provider |
-| [h2c-transform-flatten-internal-urls](https://github.com/helmfile2compose/h2c-transform-flatten-internal-urls) | Strip aliases, rewrite FQDNs to short names |
-| [h2c-rewriter-nginx](https://github.com/helmfile2compose/h2c-rewriter-nginx) | Nginx ingress annotation rewriter |
-| [h2c-rewriter-traefik](https://github.com/helmfile2compose/h2c-rewriter-traefik) | Traefik ingress annotation rewriter (POC) |
 
 ## License
 
